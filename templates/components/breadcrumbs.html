@@ -1,0 +1,10 @@
+<nav class="breadcrumbs">
+{% for crumb in crumbs %}
+    {% if not loop.first %} / {% endif %}
+    {% if crumb.is_current %}
+    <span>{{ crumb.title }}</span>
+    {% else %}
+    <a href="{{ crumb.url }}">{{ crumb.title }}</a>
+    {% endif %}
+{% endfor %}
+</nav>

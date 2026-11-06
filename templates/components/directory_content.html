@@ -1,0 +1,31 @@
+<header style="margin-bottom: 2rem;">
+    <h1>Directory: {{ dir_name }}</h1>
+    <p style="color: #868e96;">Directory overview</p>
+</header>
+<section class="directory-list">
+    {% if subdirectories and subdirectories|length > 0 %}
+    <h3>Folders</h3>
+    <ul style="list-style-type: none; padding-left: 0;">
+        {% for d in subdirectories %}
+        <li style="padding: 0.4rem 0;">
+            📁 {% if d.has_index %}<a href="{{ d.url_path }}" style="font-weight: 500;">{{ d.name }}</a>{% else %}<span style="color: #868e96; font-weight: 500;">{{ d.name }}</span>{% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if child_pages and child_pages|length > 0 %}
+    <h3>Pages</h3>
+    <ul style="list-style-type: none; padding-left: 0;">
+        {% for p in child_pages %}
+        <li style="padding: 0.4rem 0;">
+            📄 <a href="{{ p.url_path }}">{{ p.title }}</a>
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if (not subdirectories or subdirectories|length == 0) and (not child_pages or child_pages|length == 0) %}
+    <p style="font-style: italic; color: #868e96;">This folder is empty.</p>
+    {% endif %}
+</section>

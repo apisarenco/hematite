@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - {{ config.name | default("Hematite") }}</title>
+    <link rel="stylesheet" href="/_static/vendor/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="/_static/css/app.css">
+</head>
+<body data-theme="{{ config.theme | default("default") }}">
+    <nav class="sidebar" id="region-sidebar">
+        {% block navigation %}
+        <div class="search-bar">
+            <input type="text" id="search-input" placeholder="Search docs..." />
+            <div id="search-results" style="display:none; margin-top:0.5rem;"></div>
+        </div>
+        <div class="nav-tree">
+            {{ navigation_html | safe }}
+        </div>
+        <div style="margin-top:auto; font-size:0.75rem; color:#868e96;">
+            <a href="/_user/login">Login</a> | <a href="/_admin/">Admin</a>
+        </div>
+        {% endblock %}
+    </nav>
+
+    <main class="main-content">
+        <div class="breadcrumbs" id="region-breadcrumbs">
+            {% block breadcrumbs %}
+            {{ breadcrumbs_html | safe }}
+            {% endblock %}
+        </div>
+
+        <article class="prose" id="region-content">
+            {% block content %}
+            {{ content_html | safe }}
+            {% endblock %}
+        </article>
+    </main>
+
+    <aside class="toc-container" id="region-toc">
+        {% block toc %}
+        {{ toc_html | safe }}
+        {% endblock %}
+    </aside>
+
+    <script src="/_static/js/app.js"></script>
+</body>
+</html>

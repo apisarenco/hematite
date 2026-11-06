@@ -1,0 +1,47 @@
+[package]
+name = "hematite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# HTTP & Async Runtime
+tokio = { version = "1.38", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+
+# SQLite & Data Storage
+rusqlite = { version = "0.31", features = ["bundled", "bundled-full", "backup"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+
+# Markdown & Text Processing
+pulldown-cmark = { version = "0.11", default-features = false, features = ["html"] }
+gray_matter = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Templating
+minijinja = { version = "2.0", features = ["loader", "json"] }
+
+# File Monitoring
+notify = { version = "6.1", default-features = false }
+
+# Auth & Crypto
+jsonwebtoken = "9.3"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Build & CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+walkdir = "2.5"
+regex = "1.10"
+urlencoding = "2.1"
+rhai = { version = "1.27.0", features = ["sync", "serde"] }
+mlua = { version = "0.12.2", features = ["lua54", "vendored", "serialize", "send"] }
+

@@ -1,0 +1,26 @@
+{% macro render_tree(node) %}
+<ul class="nav-list">
+{% for item in node.subdirs %}
+    <li>
+        <details class="nav-folder"{% if item.is_open %} open{% endif %}>
+            <summary class="nav-folder-title">
+                {% if item.has_index %}
+                <a href="{{ item.path }}"{% if item.is_active %} class="active"{% endif %}>📁 {{ item.display_name }}</a>
+                {% else %}
+                <span class="folder-name">📁 {{ item.display_name }}</span>
+                {% endif %}
+            </summary>
+            {{ render_tree(item) }}
+        </details>
+    </li>
+{% endfor %}
+
+{% for page in node.pages %}
+    <li>
+        <a href="{{ page.url_path }}"{% if page.is_active %} class="active"{% endif %}>📄 {{ page.title }}</a>
+    </li>
+{% endfor %}
+</ul>
+{% endmacro %}
+
+{{ render_tree(tree) }}

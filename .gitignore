@@ -1,0 +1,6 @@
+target/
+.notes/
+themes/
+docker-compose.yml
+*.db
+hematite.yaml
