@@ -2,6 +2,7 @@
 name = "hematite"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 # HTTP & Async Runtime
@@ -34,6 +35,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+ciborium = "0.2"
 
 # Build & CLI
 clap = { version = "4.5", features = ["derive", "env"] }

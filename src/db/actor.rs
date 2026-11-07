@@ -15,6 +15,8 @@ pub struct PageRecord {
     pub raw_content: String,
     pub taxonomy: String,
     pub links: Vec<String>,
+    pub ast_blob: Vec<u8>,
+    pub build_hash: [u8; 16],
 }
 
 #[derive(Debug)]
@@ -47,6 +49,18 @@ pub enum DbWriteCommand {
     },
     UpdatePageFromHook {
         entity: Box<crate::scripts::PageHookEntity>,
+        resp: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    UpdatePageRenderedHtml {
+        url_path: String,
+        content_hash: [u8; 16],
+        parsed_html: String,
+        build_hash: [u8; 16],
+        resp: Option<oneshot::Sender<Result<bool, String>>>,
+    },
+    SetSystemMeta {
+        key: String,
+        value: Vec<u8>,
         resp: Option<oneshot::Sender<Result<(), String>>>,
     },
     ExecuteRaw {
@@ -152,6 +166,40 @@ impl DbWriterHandle {
         self.tx
             .send(DbWriteCommand::UpdatePageFromHook {
                 entity: Box::new(entity),
+                resp: Some(resp_tx),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        resp_rx.await.map_err(|e| e.to_string())?
+    }
+
+    pub async fn update_page_rendered_html(
+        &self,
+        url_path: String,
+        content_hash: [u8; 16],
+        parsed_html: String,
+        build_hash: [u8; 16],
+    ) -> Result<bool, String> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(DbWriteCommand::UpdatePageRenderedHtml {
+                url_path,
+                content_hash,
+                parsed_html,
+                build_hash,
+                resp: Some(resp_tx),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        resp_rx.await.map_err(|e| e.to_string())?
+    }
+
+    pub async fn set_system_meta(&self, key: String, value: Vec<u8>) -> Result<(), String> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(DbWriteCommand::SetSystemMeta {
+                key,
+                value,
                 resp: Some(resp_tx),
             })
             .await

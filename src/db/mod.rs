@@ -89,6 +89,26 @@ impl DbActor {
                         let _ = resp.send(res);
                     }
                 }
+                DbWriteCommand::UpdatePageRenderedHtml {
+                    url_path,
+                    content_hash,
+                    parsed_html,
+                    build_hash,
+                    resp,
+                } => {
+                    let res = self
+                        .handle_update_page_rendered_html(&url_path, &content_hash, &parsed_html, &build_hash)
+                        .map_err(|e| e.to_string());
+                    if let Some(resp) = resp {
+                        let _ = resp.send(res);
+                    }
+                }
+                DbWriteCommand::SetSystemMeta { key, value, resp } => {
+                    let res = self.handle_set_system_meta(&key, &value).map_err(|e| e.to_string());
+                    if let Some(resp) = resp {
+                        let _ = resp.send(res);
+                    }
+                }
                 DbWriteCommand::ExecuteRaw { sql, resp } => {
                     let res = self.conn.execute(&sql, []).map_err(|e| e.to_string());
                     if let Some(resp) = resp {
@@ -113,8 +133,8 @@ impl DbActor {
             r#"INSERT INTO pages (
                 url_path, file_path, title, parent_path, depth,
                 is_dir_index, content_hash, frontmatter_json,
-                parsed_html, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                parsed_html, ast_blob, build_hash, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
             ON CONFLICT(url_path) DO UPDATE SET
                 file_path = excluded.file_path,
                 title = excluded.title,
@@ -124,6 +144,8 @@ impl DbActor {
                 content_hash = excluded.content_hash,
                 frontmatter_json = excluded.frontmatter_json,
                 parsed_html = excluded.parsed_html,
+                ast_blob = excluded.ast_blob,
+                build_hash = excluded.build_hash,
                 updated_at = excluded.updated_at"#,
             params![
                 page.url_path,
@@ -135,6 +157,8 @@ impl DbActor {
                 page.content_hash.as_slice(),
                 page.frontmatter_json,
                 page.parsed_html,
+                page.ast_blob.as_slice(),
+                page.build_hash.as_slice(),
                 now,
             ],
         )?;
@@ -309,7 +333,7 @@ impl DbActor {
 
     fn handle_get_all_pages_for_hooks(&self) -> Result<Vec<crate::scripts::PageHookEntity>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT url_path, file_path, title, parent_path, depth, is_dir_index, frontmatter_json, parsed_html
+            "SELECT url_path, file_path, title, parent_path, depth, is_dir_index, frontmatter_json, parsed_html, ast_blob
              FROM pages ORDER BY url_path ASC;",
         )?;
 
@@ -322,12 +346,13 @@ impl DbActor {
             let is_dir_index: bool = r.get::<_, i32>(5)? == 1;
             let frontmatter_json: String = r.get(6)?;
             let parsed_html: String = r.get::<_, Option<String>>(7)?.unwrap_or_default();
-            Ok((url_path, file_path, title, parent_path, depth, is_dir_index, frontmatter_json, parsed_html))
+            let ast_blob: Option<Vec<u8>> = r.get(8)?;
+            Ok((url_path, file_path, title, parent_path, depth, is_dir_index, frontmatter_json, parsed_html, ast_blob))
         })?;
 
         let mut pages = Vec::new();
         for r in rows.flatten() {
-            let (url_path, file_path, title, parent_path, depth, is_dir_index, frontmatter_json, parsed_html) = r;
+            let (url_path, file_path, title, parent_path, depth, is_dir_index, frontmatter_json, parsed_html, ast_blob) = r;
             // Fetch links for page
             let mut links = Vec::new();
             if let Ok(mut l_stmt) = self.conn.prepare("SELECT target_raw FROM page_links WHERE source_url = ?1;") {
@@ -337,6 +362,17 @@ impl DbActor {
                     }
                 }
             }
+
+            let ast_json = if let Some(bytes) = ast_blob {
+                if let Ok(ast) = crate::markdown::ast::DocAst::from_cbor(&bytes) {
+                    serde_json::to_value(ast).unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::Value::Null
+                }
+            } else {
+                serde_json::Value::Null
+            };
+
             pages.push(crate::scripts::PageHookEntity {
                 url_path,
                 file_path,
@@ -349,6 +385,7 @@ impl DbActor {
                 raw_content: String::new(),
                 taxonomy: String::new(),
                 links,
+                ast_json,
             });
         }
 
@@ -440,6 +477,44 @@ impl DbActor {
         tx.execute("UPDATE pages_fts SET title = ?1 WHERE url_path = ?2;", params![entity.title, entity.url_path])?;
 
         tx.commit()?;
+        Ok(())
+    }
+
+    fn handle_update_page_rendered_html(
+        &mut self,
+        url_path: &str,
+        content_hash: &[u8; 16],
+        parsed_html: &str,
+        build_hash: &[u8; 16],
+    ) -> Result<bool, rusqlite::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // OCC check: only update if content_hash matches!
+        let updated = self.conn.execute(
+            "UPDATE pages 
+             SET parsed_html = ?1, build_hash = ?2, updated_at = ?3 
+             WHERE url_path = ?4 AND content_hash = ?5;",
+            params![
+                parsed_html,
+                build_hash.as_slice(),
+                now,
+                url_path,
+                content_hash.as_slice(),
+            ],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    fn handle_set_system_meta(&mut self, key: &str, value: &[u8]) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO system_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            params![key, value],
+        )?;
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 use tracing::info;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+pub const CURRENT_SCHEMA_VERSION: i32 = 3;
 
 pub fn initialize_database(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     // Enable WAL mode, synchronous=NORMAL, and foreign_keys=ON
@@ -51,6 +51,45 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         info!("Applied migration v2");
     }
 
+    if current_version < 3 {
+        migrate_v3(conn)?;
+        current_version = 3;
+        conn.execute("DELETE FROM schema_version;", [])?;
+        conn.execute("INSERT INTO schema_version (version) VALUES (?1);", params![current_version])?;
+        info!("Applied migration v3");
+    }
+
+    Ok(())
+}
+
+fn migrate_v3(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction()?;
+
+    // Add ast_blob and build_hash to pages if they do not exist
+    let has_ast_blob: bool = tx
+        .prepare("SELECT ast_blob FROM pages LIMIT 1;")
+        .is_ok();
+    if !has_ast_blob {
+        tx.execute("ALTER TABLE pages ADD COLUMN ast_blob BLOB;", [])?;
+    }
+
+    let has_build_hash: bool = tx
+        .prepare("SELECT build_hash FROM pages LIMIT 1;")
+        .is_ok();
+    if !has_build_hash {
+        tx.execute("ALTER TABLE pages ADD COLUMN build_hash BLOB;", [])?;
+    }
+
+    // System metadata key-value table for tracking current_build_hash
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS system_meta (
+            key TEXT PRIMARY KEY,
+            value BLOB NOT NULL
+        );",
+        [],
+    )?;
+
+    tx.commit()?;
     Ok(())
 }
 

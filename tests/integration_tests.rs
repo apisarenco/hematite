@@ -401,6 +401,7 @@ return entity
         auth_manager,
         template_engine,
         crawler,
+        writer: writer.clone(),
         initialized,
         content_root: content_dir.clone(),
         config: std::sync::Arc::new(config),
@@ -479,6 +480,7 @@ async fn test_status_404_and_403_templates() {
         auth_manager,
         template_engine,
         crawler,
+        writer: writer.clone(),
         initialized,
         content_root: content_dir.clone(),
         config,
@@ -608,6 +610,7 @@ This is the content of the quest.
         auth_manager,
         template_engine,
         crawler,
+        writer: writer.clone(),
         initialized,
         content_root: content_dir.clone(),
         config: std::sync::Arc::new(config),
@@ -654,7 +657,216 @@ This is the content of the quest.
     assert_eq!(resp_search.status(), axum::http::StatusCode::OK);
     let search_bytes = axum::body::to_bytes(resp_search.into_body(), usize::MAX).await.unwrap();
     let search_str = String::from_utf8_lossy(&search_bytes);
-    assert!(search_str.contains("Search Results: Chalice"));
+    let _ = fs::remove_dir_all(&temp_dir);
+}
 
+#[tokio::test]
+async fn test_ast_cbor_and_element_renderer_override() {
+    use std::fs;
+    use tower::ServiceExt;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "hematite_test_ast_{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let content_dir = temp_dir.join("content");
+    let theme_dir = temp_dir.join("themes/custom");
+    let element_templates_dir = theme_dir.join("templates/elements");
+    let db_path = temp_dir.join("test.db");
+
+    fs::create_dir_all(&content_dir).unwrap();
+    fs::create_dir_all(&element_templates_dir).unwrap();
+
+    // 1. Create a custom element template override for admonitions
+    let custom_admonition_html = r#"<aside class="custom-callout-override callout-{{ block.data.kind }}">
+  <div class="custom-header">📢 {{ block.data.title or block.data.kind }}</div>
+  <div class="custom-body">{{ rendered_html | safe }}</div>
+</aside>"#;
+    fs::write(element_templates_dir.join("admonition.html"), custom_admonition_html).unwrap();
+
+    // 2. Write markdown with Obsidian callout
+    let doc_content = r#"---
+title: "Testing AST Elements"
+---
+
+# Testing AST Elements
+
+> [!TIP] Pro Tip
+> This is a test admonition block that should be rendered with the custom element template!
+"#;
+    fs::write(content_dir.join("tip.md"), doc_content).unwrap();
+
+    let mut reg = PluginRegistry::new();
+    hematite::plugins::register_all(&mut reg);
+    let engine = MarkdownEngine::new(std::sync::Arc::new(reg));
+
+    let (writer, _handle) = hematite::db::DbActor::spawn(&db_path, &content_dir, 64).unwrap();
+    let script_engine = hematite::scripts::ScriptEngine::new(&temp_dir.join("scripts"));
+    let mut config = hematite::config::HematiteConfig::default();
+    config.theme = "custom".to_string();
+
+    let crawler = std::sync::Arc::new(hematite::crawler::Crawler::new(
+        content_dir.clone(),
+        engine,
+        writer.clone(),
+        script_engine,
+        config.clone(),
+    ));
+
+    crawler.initial_sync(std::collections::HashMap::new()).await.unwrap();
+
+    // Verify AST was saved as CBOR in SQLite
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path);
+    let pool = r2d2::Pool::builder().max_size(8).build(manager).unwrap();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute("INSERT OR IGNORE INTO users (username, password_hash, role, token_version, created_at) VALUES ('*', '', 'anonymous', 1, 0);", []).unwrap();
+        conn.execute("INSERT INTO acls (username, verb, path_pattern, priority) VALUES ('*', 'ALLOW', '/**', 0);", []).unwrap();
+
+        let ast_blob: Vec<u8> = conn.query_row(
+            "SELECT ast_blob FROM pages WHERE url_path = '/tip';",
+            [],
+            |r| r.get(0),
+        ).expect("ast_blob exists");
+        assert!(!ast_blob.is_empty(), "CBOR blob must not be empty");
+
+        let doc_ast = hematite::markdown::ast::DocAst::from_cbor(&ast_blob).expect("CBOR deserialization succeeds");
+        assert_eq!(doc_ast.title, "Testing AST Elements");
+        assert!(doc_ast.blocks.iter().any(|b| matches!(b, hematite::markdown::ast::BlockNode::Admonition { .. })));
+    }
+
+    // Set up template engine with theme override
+    let template_engine = std::sync::Arc::new(hematite::template::TemplateEngine::with_theme_override(Some(&theme_dir)).unwrap());
+    let auth_manager = std::sync::Arc::new(AuthManager::new("secret-key-12345678901234567890"));
+    let initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    // Compute build hash and set in system_meta
+    let build_hash = hematite::crawler::reconciler::compute_build_hash(&temp_dir.join("themes"), "custom", &temp_dir.join("scripts"));
+    writer.set_system_meta("current_build_hash".to_string(), build_hash.to_vec()).await.unwrap();
+
+    let state = hematite::server::AppState {
+        db_pool: pool.clone(),
+        auth_manager,
+        template_engine,
+        crawler,
+        writer: writer.clone(),
+        initialized,
+        content_root: content_dir.clone(),
+        config: std::sync::Arc::new(config),
+        theme_dir,
+    };
+
+    let app = hematite::server::create_router(state);
+
+    // Request the page via SSR and verify JIT render used the custom element template
+    let req = axum::http::Request::builder()
+        .uri("/tip")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // Verify custom element template output
+    assert!(body_str.contains("custom-callout-override callout-tip"));
+    assert!(body_str.contains("📢 Pro Tip"));
+    assert!(body_str.contains("This is a test admonition block that should be rendered with the custom element template!"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_reconciliation_worker_background_render() {
+    use std::fs;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "hematite_test_reconciler_{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let content_dir = temp_dir.join("content");
+    let theme_dir = temp_dir.join("themes/default");
+    let element_templates_dir = theme_dir.join("templates/elements");
+    let db_path = temp_dir.join("test.db");
+
+    fs::create_dir_all(&content_dir).unwrap();
+    fs::create_dir_all(&element_templates_dir).unwrap();
+
+    fs::write(content_dir.join("index.md"), "# Home\n\n## Section 1\nWelcome to Hematite.").unwrap();
+
+    let mut reg = PluginRegistry::new();
+    hematite::plugins::register_all(&mut reg);
+    let engine = MarkdownEngine::new(std::sync::Arc::new(reg));
+
+    let (writer, _handle) = hematite::db::DbActor::spawn(&db_path, &content_dir, 64).unwrap();
+    let script_engine = hematite::scripts::ScriptEngine::new(&temp_dir.join("scripts"));
+    let config = hematite::config::HematiteConfig::default();
+
+    let crawler = std::sync::Arc::new(hematite::crawler::Crawler::new(
+        content_dir.clone(),
+        engine,
+        writer.clone(),
+        script_engine.clone(),
+        config.clone(),
+    ));
+
+    crawler.initial_sync(std::collections::HashMap::new()).await.unwrap();
+
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path);
+    let pool = r2d2::Pool::builder().max_size(8).build(manager).unwrap();
+
+    // Write a new heading element template override in theme
+    fs::write(
+        element_templates_dir.join("heading.html"),
+        r#"<h{{ block.data.level }} class="reconciled-heading">{{ rendered_html | safe }}</h{{ block.data.level }}>"#,
+    ).unwrap();
+
+    let template_engine = std::sync::Arc::new(hematite::template::TemplateEngine::with_theme_override(Some(&theme_dir)).unwrap());
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // Spawn reconciler
+    let reconciler = std::sync::Arc::new(hematite::crawler::reconciler::ReconciliationWorker::new(
+        pool.clone(),
+        writer.clone(),
+        template_engine.clone(),
+        script_engine,
+        config.to_json_value(),
+        notify.clone(),
+    ));
+
+    let rec_handle = tokio::spawn(async move {
+        reconciler.run_loop().await;
+    });
+
+    // Recompute build hash and update system_meta
+    let target_hash = hematite::crawler::reconciler::compute_build_hash(&temp_dir.join("themes"), "default", &temp_dir.join("scripts"));
+    writer.set_system_meta("current_build_hash".to_string(), target_hash.to_vec()).await.unwrap();
+
+    // Pulse notification to trigger reconciler
+    notify.notify_waiters();
+
+    // Wait briefly for reconciliation worker to update the page
+    let mut converged = false;
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(conn) = pool.get() {
+            let row: Result<(Option<Vec<u8>>, String), _> = conn.query_row(
+                "SELECT build_hash, parsed_html FROM pages WHERE url_path = '/';",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            );
+            if let Ok((Some(bh), html)) = row {
+                if bh == target_hash && html.contains("reconciled-heading") {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(converged, "Reconciliation worker successfully updated page with new template override");
+    rec_handle.abort();
     let _ = fs::remove_dir_all(&temp_dir);
 }

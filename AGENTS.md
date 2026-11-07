@@ -14,15 +14,25 @@ flowchart TD
     CFG[("hematite.yaml")] -->|Load config| Config["HematiteConfig"]
     
     subgraph Ingestion & Compilation
-        Crawler -->|Parse AST + YAML Frontmatter| MDParser["MarkdownEngine\n(pulldown-cmark)"]
+        Crawler -->|Parse AST + YAML Frontmatter| MDParser["MarkdownEngine\n(pulldown-cmark -> DocAst)"]
         CompilePlugins["Compile-Time Plugins\n(build.rs -> register_all)\n(Wikilinks, Admonitions)"] -.-> MDParser
-        MDParser -->|PageRecord| MPSC["Tokio MPSC Channel\n(DbWriteCommand)"]
+        MDParser -->|CBOR Serialization (ciborium)| PageRecord["PageRecord\n(ast_blob + build_hash)"]
+        PageRecord --> MPSC["Tokio MPSC Channel\n(DbWriteCommand)"]
         MPSC -->|Single-Writer Actor| Writer["SQLite Writer Actor\n(WAL mode)"]
-        Writer -->|Upsert Pages, FTS5 & Links| DB[("SQLite Database\n(pages, directories, page_links, fts5)")]
+        Writer -->|Upsert Pages, FTS5 & Links| DB[("SQLite Database\n(pages, directories, page_links, fts5, system_meta)")]
         
-        Writer -->|Post-crawl Extensibility| Hooks["Extensibility Hooks\n(Lua / Rhai in scripts/hooks)"]
+        Writer -->|Post-crawl Extensibility| Hooks["Extensibility Hooks\n(Lua / Rhai with entity.ast)"]
         Config -.-> Hooks
-        Hooks -->|Update Titles, Frontmatter, HTML| Writer
+        Hooks -->|Update Titles, Frontmatter, AST| Writer
+    end
+
+    subgraph Background Reconciliation & Invalidation
+        Watcher["File Watcher (themes/ + scripts/)"] -->|Change Detected| CompHash["Compute Hash (xxh3_128)"]
+        CompHash -->|Set current_build_hash| DB
+        CompHash -->|Pulse Notify| Reconciler["Reconciliation Worker (tokio background)"]
+        Reconciler -->|Fetch Outdated Pages| DB
+        Reconciler -->|Element Renderer (Minijinja / Hardcoded)| Reconciler
+        Reconciler -->|OCC Update (WHERE content_hash = ?)| Writer
     end
 
     subgraph Serving & Request Pipeline
@@ -30,9 +40,17 @@ flowchart TD
         Axum -->|Session / Bearer JWT| Auth["ACL Middleware\n(Token version + path glob matching)"]
         Auth -->|Read-only pool query| DB
         
-        Auth -->|Render layout / regions| Templates["Minijinja Template Engine\n(Base / Embedded + Theme Overrides)"]
-        Templates -->|Full HTML| SSR["SSR Full Refresh"]
-        Templates -->|JSON Regions: content, sidebar, toc| API["SPA JSON API\n(/_api/v1/page)"]
+        DB --> FreshCheck{"build_hash == current?"}
+        FreshCheck -->|Yes| FastServe["Serve cached HTML (< 1ms)"]
+        FreshCheck -->|No (Cache Miss)| JIT["JIT Render via ElementRenderer\n(Minijinja element templates or fast emitter)"]
+        JIT --> AsyncCache["Background update SQLite cache"]
+        AsyncCache -.-> Writer
+        JIT --> RenderTemplates
+        FastServe --> RenderTemplates
+
+        RenderTemplates["Minijinja Template Engine\n(page.html layout + Theme Overrides)"]
+        RenderTemplates -->|Full HTML| SSR["SSR Full Refresh"]
+        RenderTemplates -->|JSON Regions: content, sidebar, toc| API["SPA JSON API\n(/_api/v1/page)"]
         
         SSR --> Client
         API --> Client

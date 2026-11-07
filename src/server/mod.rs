@@ -19,6 +19,7 @@ use tower::ServiceExt;
 use crate::auth::{AclEngine, AclRule, AuthManager, Claims};
 use crate::config::HematiteConfig;
 use crate::crawler::Crawler;
+use crate::db::actor::DbWriterHandle;
 use crate::template::TemplateEngine;
 
 #[derive(Clone)]
@@ -27,6 +28,7 @@ pub struct AppState {
     pub auth_manager: Arc<AuthManager>,
     pub template_engine: Arc<TemplateEngine>,
     pub crawler: Arc<Crawler>,
+    pub writer: DbWriterHandle,
     pub initialized: Arc<AtomicBool>,
     pub content_root: std::path::PathBuf,
     pub config: Arc<HematiteConfig>,
@@ -266,11 +268,12 @@ async fn ssr_handler(
     })?;
 
     // 1. Check if direct page exists
-    let page: Option<(String, String, String, String)> = conn
+    let page_query: Option<(String, String, String, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
         .query_row(
-            "SELECT title, frontmatter_json, parsed_html, parent_path FROM pages WHERE url_path = ?1;",
+            "SELECT p.title, p.frontmatter_json, p.parsed_html, p.parent_path, p.ast_blob, p.build_hash, p.content_hash
+             FROM pages p WHERE p.url_path = ?1;",
             params![normalized],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )
         .ok();
 
@@ -278,7 +281,48 @@ async fn ssr_handler(
     let user_ctx = build_user_context(claims.as_ref());
     let all_tags = get_all_distinct_tags(&conn);
 
-    if let Some((title, fm_json, html, parent_path)) = page {
+    if let Some((title, fm_json, html, parent_path, ast_blob, build_hash, content_hash)) = page_query {
+        let current_target_hash: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM system_meta WHERE key = 'current_build_hash';",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+
+        // Check if JIT render is needed
+        let mut final_html = html;
+        if let (Some(target_hash), Some(ast_bytes), Some(c_hash)) = (current_target_hash, ast_blob, content_hash) {
+            let needs_jit = match build_hash {
+                Some(ref bh) => bh != &target_hash,
+                None => true,
+            };
+
+            if needs_jit {
+                if let Ok(ast) = crate::markdown::ast::DocAst::from_cbor(&ast_bytes) {
+                    let renderer = crate::template::renderer::ElementRenderer::new(state.template_engine.clone());
+                    let fresh_html = renderer.render_doc(&ast);
+                    final_html = fresh_html.clone();
+
+                    let mut target_arr = [0u8; 16];
+                    if target_hash.len() == 16 {
+                        target_arr.copy_from_slice(&target_hash);
+                    }
+                    let mut content_arr = [0u8; 16];
+                    if c_hash.len() == 16 {
+                        content_arr.copy_from_slice(&c_hash);
+                    }
+
+                    // Asynchronously update SQLite cache
+                    let writer = state.writer.clone();
+                    let u = normalized.clone();
+                    tokio::spawn(async move {
+                        let _ = writer.update_page_rendered_html(u, content_arr, fresh_html, target_arr).await;
+                    });
+                }
+            }
+        }
+
         let (nav_html, breadcrumbs_html, toc_html) = build_page_chrome(&conn, &state.template_engine, &normalized, &title);
         let fm_val: serde_json::Value =
             serde_json::from_str(&fm_json).unwrap_or(json!({}));
@@ -293,7 +337,7 @@ async fn ssr_handler(
                 json!({
                     "title": title,
                     "title_source": title_source,
-                    "content_html": html,
+                    "content_html": final_html,
                     "navigation_html": nav_html,
                     "breadcrumbs_html": breadcrumbs_html,
                     "toc_html": toc_html,
@@ -438,15 +482,57 @@ async fn api_page(
         )
     })?;
 
-    let page: Option<(String, String, String, String)> = conn
+    let page_query: Option<(String, String, String, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
         .query_row(
-            "SELECT title, frontmatter_json, parsed_html, parent_path FROM pages WHERE url_path = ?1;",
+            "SELECT p.title, p.frontmatter_json, p.parsed_html, p.parent_path, p.ast_blob, p.build_hash, p.content_hash
+             FROM pages p WHERE p.url_path = ?1;",
             params![normalized],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )
         .ok();
 
-    if let Some((title, fm_json, html, parent_path)) = page {
+    if let Some((title, fm_json, html, parent_path, ast_blob, build_hash, content_hash)) = page_query {
+        let current_target_hash: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM system_meta WHERE key = 'current_build_hash';",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+
+        // Check if JIT render is needed
+        let mut final_html = html;
+        if let (Some(target_hash), Some(ast_bytes), Some(c_hash)) = (current_target_hash, ast_blob, content_hash) {
+            let needs_jit = match build_hash {
+                Some(ref bh) => bh != &target_hash,
+                None => true,
+            };
+
+            if needs_jit {
+                if let Ok(ast) = crate::markdown::ast::DocAst::from_cbor(&ast_bytes) {
+                    let renderer = crate::template::renderer::ElementRenderer::new(state.template_engine.clone());
+                    let fresh_html = renderer.render_doc(&ast);
+                    final_html = fresh_html.clone();
+
+                    let mut target_arr = [0u8; 16];
+                    if target_hash.len() == 16 {
+                        target_arr.copy_from_slice(&target_hash);
+                    }
+                    let mut content_arr = [0u8; 16];
+                    if c_hash.len() == 16 {
+                        content_arr.copy_from_slice(&c_hash);
+                    }
+
+                    // Asynchronously update SQLite cache
+                    let writer = state.writer.clone();
+                    let u = normalized.clone();
+                    tokio::spawn(async move {
+                        let _ = writer.update_page_rendered_html(u, content_arr, fresh_html, target_arr).await;
+                    });
+                }
+            }
+        }
+
         let (nav_html, breadcrumbs_html, toc_html) = build_page_chrome(&conn, &state.template_engine, &normalized, &title);
         let fm_val: serde_json::Value =
             serde_json::from_str(&fm_json).unwrap_or(json!({}));
@@ -464,7 +550,7 @@ async fn api_page(
             "next_sibling_url": next_sibling_url,
             "config": state.config.to_json_value(),
             "regions": {
-                "content": html,
+                "content": final_html,
                 "toc": toc_html,
                 "breadcrumbs": breadcrumbs_html,
                 "navigation": nav_html,

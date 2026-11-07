@@ -156,15 +156,33 @@ title: Features
         }
     }
 
-    // 5. Initialize script engine & crawler
+    // 5. Initialize script engine, reconciler notify, and crawler
+    let reconciler_notify = Arc::new(tokio::sync::Notify::new());
     let script_engine = scripts::ScriptEngine::new(&cli.scripts);
     let crawler = Arc::new(crawler::Crawler::new(
         cli.content.clone(),
         md_engine,
         writer_handle.clone(),
-        script_engine,
+        script_engine.clone(),
         (*config).clone(),
     ));
+
+    // Save initial build hash in system_meta
+    let initial_build_hash = crawler::reconciler::compute_build_hash(&cli.themes, &config.theme, &cli.scripts);
+    let _ = writer_handle.set_system_meta("current_build_hash".to_string(), initial_build_hash.to_vec()).await;
+
+    // Spawn background reconciliation worker
+    let reconciler = Arc::new(crawler::reconciler::ReconciliationWorker::new(
+        pool.clone(),
+        writer_handle.clone(),
+        template_engine.clone(),
+        script_engine,
+        config.to_json_value(),
+        reconciler_notify.clone(),
+    ));
+    tokio::spawn(async move {
+        reconciler.run_loop().await;
+    });
 
     // Perform initial filesystem crawl in background task or immediately
     let crawler_clone = crawler.clone();
@@ -196,7 +214,15 @@ title: Features
     });
 
     // 6. Start file watcher
-    let watcher_service = watcher::WatcherService::new(cli.content.clone(), (*crawler).clone());
+    let watcher_service = watcher::WatcherService::new(
+        cli.content.clone(),
+        cli.themes.clone(),
+        cli.scripts.clone(),
+        config.theme.clone(),
+        (*crawler).clone(),
+        writer_handle.clone(),
+        reconciler_notify.clone(),
+    );
     if let Err(e) = watcher_service.start() {
         tracing::error!(error = %e, "Failed to initialize watcher service");
     }
@@ -207,6 +233,7 @@ title: Features
         auth_manager,
         template_engine,
         crawler,
+        writer: writer_handle,
         initialized,
         content_root: cli.content.clone(),
         config: config.clone(),

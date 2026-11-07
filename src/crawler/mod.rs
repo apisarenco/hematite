@@ -1,3 +1,5 @@
+pub mod reconciler;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -152,6 +154,8 @@ impl Crawler {
                 raw_content: parsed.raw_content,
                 taxonomy: String::new(),
                 links: parsed.links,
+                ast_blob: parsed.ast_blob,
+                build_hash: [0u8; 16],
             };
 
             self.writer.upsert_page(record).await.map_err(|e| e)?;
@@ -326,6 +330,8 @@ impl Crawler {
             raw_content: parsed.raw_content,
             taxonomy: String::new(),
             links: parsed.links,
+            ast_blob: parsed.ast_blob,
+            build_hash: [0u8; 16],
         };
 
         self.writer.upsert_page(record).await.map_err(|e| e)?;

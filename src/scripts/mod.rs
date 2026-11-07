@@ -18,6 +18,8 @@ pub struct PageHookEntity {
     pub raw_content: String,
     pub taxonomy: String,
     pub links: Vec<String>,
+    #[serde(default)]
+    pub ast_json: serde_json::Value,
 }
 
 /// Information provided to page hooks about directory, page context, and site configuration

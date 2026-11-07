@@ -1,3 +1,6 @@
+pub mod ast;
+pub mod builder;
+
 use gray_matter::engine::YAML;
 use gray_matter::Matter;
 use pulldown_cmark::{html, Event, Options, Parser};
@@ -15,6 +18,8 @@ pub struct ParsedDoc {
     pub raw_content: String,
     pub links: Vec<String>,
     pub toc_html: String,
+    pub ast: ast::DocAst,
+    pub ast_blob: Vec<u8>,
 }
 
 pub struct MarkdownEngine {
@@ -192,7 +197,18 @@ impl MarkdownEngine {
             }
         }
 
-        // Apply callout/admonition container transformation
+        // Build DocAst object model from untransformed callouts (builder handles them directly)
+        let ast = builder::events_to_ast(
+            transformed_events.clone(),
+            title.clone(),
+            title_source.clone(),
+            frontmatter_val,
+            links.clone(),
+        );
+
+        let ast_blob = ast.to_cbor().unwrap_or_default();
+
+        // Apply callout/admonition container transformation for fallback HTML
         let transformed_events = crate::plugins::admonitions::process_callouts(transformed_events);
 
         let mut html_output = String::new();
@@ -209,6 +225,8 @@ impl MarkdownEngine {
             raw_content: content,
             links,
             toc_html,
+            ast,
+            ast_blob,
         }
     }
 }

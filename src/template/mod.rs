@@ -3,11 +3,16 @@ use std::fs;
 use std::path::Path;
 use tracing::info;
 
+pub mod renderer;
+
 pub struct TemplateEngine {
     env: Environment<'static>,
 }
 
 impl TemplateEngine {
+    pub fn env(&self) -> &Environment<'static> {
+        &self.env
+    }
     pub fn new() -> Result<Self, JinjaError> {
         Self::with_theme_override(None)
     }
