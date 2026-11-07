@@ -23,13 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory and data directory writable by UID 33 (www-data)
-RUN mkdir -p /app /data /content && chown -R 33:33 /app /data
-
 COPY --from=builder /build/target/release/hematite /usr/local/bin/hematite
 
 WORKDIR /app
-USER 33:33
 
 ENV HEMATITE_CONTENT_DIR=/content
 ENV HEMATITE_DB_PATH=/data/hematite.db

@@ -115,12 +115,68 @@ flowchart TD
 
 ## 🚀 Quick Start
 
-### 1. Build and Run
+### 1. Running with Docker & Docker Compose (Recommended)
+
+Hematite is published as a lightweight, unprivileged container image (`UID 33` / `www-data`) on GitHub Container Registry: `ghcr.io/apisarenco/hematite`.
+
+You can use the sample compose setup provided in [`docker/docker-compose.yaml`](docker/docker-compose.yaml):
+
+```yaml
+services:
+  hematite:
+    image: ghcr.io/apisarenco/hematite:latest
+    container_name: hematite
+    # Use a uid:gid that has read access to all the mounted media
+    user: "33:33"
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - HEMATITE_CONTENT_DIR=/content
+      - HEMATITE_THEMES_DIR=/app/themes
+      - HEMATITE_SCRIPTS_DIR=/app/scripts
+      - HEMATITE_CONFIG_PATH=/app/hematite.yaml
+      - HEMATITE_DB_PATH=/data/hematite.db
+      - HEMATITE_BIND_ADDR=0.0.0.0:3000
+      - HEMATITE_JWT_SECRET=${HEMATITE_JWT_SECRET:-supersecretkey12345678901234567890}
+    volumes:
+      - hematite_data:/data
+      - ./hematite.yaml:/app/hematite.yaml:ro
+      - ./themes:/app/themes:ro
+      - ./scripts:/app/scripts:ro
+      - ./content:/content:ro
+
+volumes:
+  hematite_data:
+```
+
+Start the daemon in detached mode:
+```bash
+docker compose -f docker/docker-compose.yaml up -d
+```
+
+Or run directly with the Docker CLI:
+```bash
+docker run -d \
+  --name hematite \
+  --user 33:33 \
+  -p 3000:3000 \
+  -v $(pwd)/content:/content:ro \
+  -v $(pwd)/hematite.yaml:/app/hematite.yaml:ro \
+  -v $(pwd)/themes:/app/themes:ro \
+  -v $(pwd)/scripts:/app/scripts:ro \
+  -v hematite_data:/data \
+  ghcr.io/apisarenco/hematite:latest
+```
+
+---
+
+### 2. Building from Source (Local Native Run)
 Hematite compiles into a single self-contained binary with zero dynamic runtime dependencies:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/hematite.git
+git clone https://github.com/apisarenco/hematite.git
 cd hematite
 
 # Run with defaults (creates ./content with sample files if empty)
@@ -137,7 +193,9 @@ cargo run --release -- \
   --bind 0.0.0.0:3000
 ```
 
-### 2. Configuration (`hematite.yaml`)
+---
+
+### 3. Configuration (`hematite.yaml`)
 Place a `hematite.yaml` at the root of your project:
 
 ```yaml

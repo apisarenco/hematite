@@ -1,0 +1,90 @@
+name: Release & Container Build
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Determine Version, Tag & Publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install svu
+        run: |
+          SVU_VERSION="v3.2.3"
+          curl -sSL "https://github.com/caarlos0/svu/releases/download/${SVU_VERSION}/svu_${SVU_VERSION#v}_linux_amd64.tar.gz" | tar -xz -C /usr/local/bin svu
+          chmod +x /usr/local/bin/svu
+
+      - name: Determine Next Semantic Version
+        id: svu
+        run: |
+          # Use --always to ensure a bump even on initial run or chore commits (defaults to patch from v0.0.0 -> v0.0.1)
+          NEXT_VERSION=$(svu next --always)
+          echo "Full version: ${NEXT_VERSION}"
+
+          # Ensure leading 'v'
+          if [[ ! "${NEXT_VERSION}" =~ ^v ]]; then
+            NEXT_VERSION="v${NEXT_VERSION}"
+          fi
+
+          # Strip 'v' to extract major, minor, patch numbers
+          RAW_VERSION="${NEXT_VERSION#v}"
+          MAJOR=$(echo "${RAW_VERSION}" | cut -d. -f1)
+          MINOR=$(echo "${RAW_VERSION}" | cut -d. -f2)
+          PATCH=$(echo "${RAW_VERSION}" | cut -d. -f3)
+
+          TAG_FULL="v${MAJOR}.${MINOR}.${PATCH}"
+          TAG_MINOR="v${MAJOR}.${MINOR}"
+          TAG_MAJOR="v${MAJOR}"
+
+          echo "version=${TAG_FULL}" >> "$GITHUB_OUTPUT"
+          echo "version_minor=${TAG_MINOR}" >> "$GITHUB_OUTPUT"
+          echo "version_major=${TAG_MAJOR}" >> "$GITHUB_OUTPUT"
+          echo "Calculated tags: ${TAG_FULL}, ${TAG_MINOR}, ${TAG_MAJOR}, latest"
+
+      - name: Push Git Tag
+        run: |
+          TAG="${{ steps.svu.outputs.version }}"
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "Release ${TAG}"
+            git push origin "${TAG}"
+            echo "Pushed tag ${TAG} to repository."
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.svu.outputs.version }}
+            ghcr.io/${{ github.repository }}:${{ steps.svu.outputs.version_minor }}
+            ghcr.io/${{ github.repository }}:${{ steps.svu.outputs.version_major }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

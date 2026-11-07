@@ -1,0 +1,34 @@
+services:
+  hematite:
+    image: ghcr.io/apisarenco/hematite:latest
+    # Or build locally:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
+    container_name: hematite
+    user: "33:33"
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - HEMATITE_CONTENT_DIR=/content
+      - HEMATITE_THEMES_DIR=/app/themes
+      - HEMATITE_SCRIPTS_DIR=/app/scripts
+      - HEMATITE_CONFIG_PATH=/app/hematite.yaml
+      - HEMATITE_DB_PATH=/data/hematite.db
+      - HEMATITE_BIND_ADDR=0.0.0.0:3000
+      - HEMATITE_JWT_SECRET=${HEMATITE_JWT_SECRET:-supersecretkey12345678901234567890}
+    volumes:
+      # Site configuration
+      - ./hematite.yaml:/app/hematite.yaml:ro
+      # Themes and element templates
+      - ./themes:/app/themes:ro
+      # Extensibility hooks (Lua & Rhai)
+      - ./scripts:/app/scripts:ro
+      # Persistent SQLite cache and FTS index (writable by UID 33 / www-data)
+      - hematite_data:/data
+      # Markdown content directory (mounted read-only)
+      - ./content:/content:ro
+
+volumes:
+  hematite_data:
