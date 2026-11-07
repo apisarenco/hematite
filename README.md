@@ -5,7 +5,7 @@
 <h1 align="center">Hematite 💎</h1>
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status" /></a>
+  <a href="https://github.com/apisarenco/hematite/actions/workflows/release.yml"><img src="https://github.com/apisarenco/hematite/actions/workflows/release.yml/badge.svg?branch=main" alt="Build & Release Status" /></a>
   <a href="#"><img src="https://img.shields.io/badge/rust-edition%202021-orange.svg" alt="Rust Edition" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" /></a>
 </p>
