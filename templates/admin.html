@@ -154,6 +154,15 @@
                 <button type="submit">Add Rule</button>
             </form>
         </div>
+
+        <div class="card">
+            <h2>Cache & Content Re-parsing</h2>
+            <p style="font-size:0.875rem; color:#868e96;">Force Hematite to invalidate cached pages and immediately sweep/re-parse documents without restarting.</p>
+            <form method="POST" action="/_admin/cache/invalidate" class="form-row">
+                <input type="text" name="path" placeholder="Path pattern (leave empty to sweep all pages)" style="flex: 1;" />
+                <button type="submit">Invalidate & Sweep Cache</button>
+            </form>
+        </div>
     </div>
 </body>
 </html>

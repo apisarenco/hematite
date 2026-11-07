@@ -33,6 +33,7 @@ pub struct AppState {
     pub content_root: std::path::PathBuf,
     pub config: Arc<HematiteConfig>,
     pub theme_dir: std::path::PathBuf,
+    pub reconciler_notify: Arc<tokio::sync::Notify>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -54,6 +55,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/_admin/users/bump_version", post(admin_bump_version))
         .route("/_admin/acls/create", post(admin_create_acl))
         .route("/_admin/acls/delete", post(admin_delete_acl))
+        .route("/_admin/cache/invalidate", post(admin_invalidate_cache))
         // Wildcard SSR route
         .fallback(ssr_handler)
         // ACL middleware applied across requests
@@ -159,7 +161,7 @@ pub struct UserContext {
     pub is_admin: bool,
 }
 
-fn build_user_context(claims: Option<&Claims>) -> UserContext {
+fn build_user_context(claims: Option<&Claims>, config: &HematiteConfig) -> UserContext {
     match claims {
         Some(c) => UserContext {
             is_authenticated: true,
@@ -169,7 +171,7 @@ fn build_user_context(claims: Option<&Claims>) -> UserContext {
         },
         None => UserContext {
             is_authenticated: false,
-            username: "Mysterious Wanderer".to_string(),
+            username: config.anonymous_user_display.clone(),
             role: "anonymous".to_string(),
             is_admin: false,
         },
@@ -278,7 +280,7 @@ async fn ssr_handler(
         .ok();
 
     let claims = extract_claims_from_request(&req, &state.auth_manager);
-    let user_ctx = build_user_context(claims.as_ref());
+    let user_ctx = build_user_context(claims.as_ref(), &state.config);
     let all_tags = get_all_distinct_tags(&conn);
 
     if let Some((title, fm_json, html, parent_path, ast_blob, build_hash, content_hash)) = page_query {
@@ -720,7 +722,7 @@ async fn search_page(
     })?;
 
     let claims = extract_claims_from_request(&req, &state.auth_manager);
-    let user_ctx = build_user_context(claims.as_ref());
+    let user_ctx = build_user_context(claims.as_ref(), &state.config);
 
     let cleaned = q.q.replace('"', "").replace('*', "");
     let fts_query = format!("{}*", cleaned.trim());
@@ -809,24 +811,35 @@ async fn resolve_wikilink(
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let (target_doc, anchor) = match q.target.split_once('#') {
+        Some((doc, h)) => (doc.trim(), Some(h.trim())),
+        None => (q.target.trim(), None),
+    };
+
+    let anchor_suffix = anchor
+        .map(|h| crate::markdown::ast::slugify_heading(h))
+        .filter(|slug| !slug.is_empty())
+        .map(|slug| format!("#{slug}"))
+        .unwrap_or_default();
+
     // Look in page_links or pages table directly
     let resolved: Option<String> = conn
         .query_row(
             "SELECT resolved_url FROM page_links WHERE target_raw = ?1 AND resolved_url IS NOT NULL LIMIT 1;",
-            params![q.target],
+            params![target_doc],
             |r| r.get(0),
         )
         .ok();
 
     if let Some(target_url) = resolved {
-        return Ok(Redirect::temporary(&target_url).into_response());
+        return Ok(Redirect::temporary(&format!("{target_url}{anchor_suffix}")).into_response());
     }
 
     // Direct match against url_path or filename
-    let clean_target = q.target
+    let clean_target = target_doc
         .strip_suffix(".md")
-        .or_else(|| q.target.strip_suffix(".markdown"))
-        .unwrap_or(&q.target);
+        .or_else(|| target_doc.strip_suffix(".markdown"))
+        .unwrap_or(target_doc);
 
     let target_clean_path = if clean_target.starts_with('/') {
         clean_target.to_string()
@@ -843,11 +856,11 @@ async fn resolve_wikilink(
         .ok();
 
     if let Some(target_url) = direct {
-        return Ok(Redirect::temporary(&target_url).into_response());
+        return Ok(Redirect::temporary(&format!("{target_url}{anchor_suffix}")).into_response());
     }
 
     // Match by filename / file_path in pages table
-    let target_filename = q.target.split('/').last().unwrap_or(&q.target);
+    let target_filename = target_doc.split('/').last().unwrap_or(target_doc);
     let target_stem = target_filename
         .strip_suffix(".md")
         .or_else(|| target_filename.strip_suffix(".markdown"))
@@ -864,10 +877,10 @@ async fn resolve_wikilink(
         .ok();
 
     if let Some(target_url) = by_file {
-        return Ok(Redirect::temporary(&target_url).into_response());
+        return Ok(Redirect::temporary(&format!("{target_url}{anchor_suffix}")).into_response());
     }
 
-    Ok(Redirect::temporary(&format!("/{}", q.target.trim_start_matches('/'))).into_response())
+    Ok(Redirect::temporary(&format!("/{}{anchor_suffix}", target_doc.trim_start_matches('/'))).into_response())
 }
 
 // -------------------------------------------------------------
@@ -1329,6 +1342,57 @@ async fn admin_delete_acl(
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let _ = conn.execute("DELETE FROM acls WHERE id = ?1;", params![form.id]);
+    Ok(Redirect::to("/_admin/"))
+}
+
+#[derive(Deserialize)]
+struct AdminInvalidateCacheForm {
+    path: Option<String>,
+}
+
+async fn admin_invalidate_cache(
+    State(state): State<AppState>,
+    axum::extract::Form(form): axum::extract::Form<AdminInvalidateCacheForm>,
+) -> Result<Redirect, StatusCode> {
+    let target = form.path.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
+    
+    // 1. Invalidate cache in SQLite
+    if let Ok(conn) = state.db_pool.get() {
+        let _ = crate::crawler::invalidate_page_cache(&conn, target);
+    }
+
+    // 2. Trigger automatic sweep immediately in the background
+    let crawler = state.crawler.clone();
+    let notify = state.reconciler_notify.clone();
+    let pool = state.db_pool.clone();
+    tokio::spawn(async move {
+        // Fetch current hashes from DB to detect what needs syncing
+        let existing_hashes = {
+            let mut map = std::collections::HashMap::new();
+            if let Ok(conn) = pool.get() {
+                if let Ok(mut stmt) = conn.prepare("SELECT file_path, content_hash FROM pages;") {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    }) {
+                        for r in rows.flatten() {
+                            map.insert(r.0, r.1);
+                        }
+                    }
+                }
+            }
+            map
+        };
+
+        if let Err(e) = crawler.initial_sync(existing_hashes).await {
+            tracing::error!(error = %e, "Sweep after cache invalidation failed");
+        } else {
+            tracing::info!("Sweep after cache invalidation completed successfully");
+        }
+
+        // Pulse reconciler to re-render any outdated elements
+        notify.notify_waiters();
+    });
+
     Ok(Redirect::to("/_admin/"))
 }
 

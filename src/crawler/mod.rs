@@ -102,6 +102,7 @@ impl Crawler {
         // 2. Process files and diff hashes
         let mut updated_count = 0;
         let mut unchanged_count = 0;
+        let mut batch_records = Vec::new();
 
         for (path, rel_path) in file_entries {
             let bytes = match fs::read(&path) {
@@ -158,8 +159,17 @@ impl Crawler {
                 build_hash: [0u8; 16],
             };
 
-            self.writer.upsert_page(record).await.map_err(|e| e)?;
+            batch_records.push(record);
             updated_count += 1;
+
+            if batch_records.len() >= 50 {
+                let chunk = std::mem::take(&mut batch_records);
+                self.writer.upsert_pages_batch(chunk).await.map_err(|e| e)?;
+            }
+        }
+
+        if !batch_records.is_empty() {
+            self.writer.upsert_pages_batch(batch_records).await.map_err(|e| e)?;
         }
 
         // 3. Prune deleted records
@@ -440,6 +450,34 @@ pub fn derive_path_metadata(rel_path: &str) -> (String, String, i32, bool, Strin
     };
 
     (url_path, parent_path, depth, is_dir_index, default_title)
+}
+
+/// Invalidate page cache in SQLite, setting content_hash and build_hash to zero
+/// so that subsequent crawler indexing or request JIT re-parses and re-renders the pages.
+pub fn invalidate_page_cache(
+    conn: &rusqlite::Connection,
+    target_path: Option<&str>,
+) -> Result<usize, rusqlite::Error> {
+    match target_path {
+        Some(target) => {
+            conn.execute(
+                "UPDATE pages SET content_hash = zeroblob(16), build_hash = zeroblob(16) 
+                 WHERE url_path = ?1 OR file_path = ?1 OR url_path LIKE ?2 OR file_path LIKE ?2;",
+                rusqlite::params![target, format!("%{}%", target)],
+            )
+        }
+        None => {
+            let affected = conn.execute(
+                "UPDATE pages SET content_hash = zeroblob(16), build_hash = zeroblob(16);",
+                [],
+            )?;
+            let _ = conn.execute(
+                "UPDATE system_meta SET value = zeroblob(16) WHERE key = 'current_build_hash';",
+                [],
+            );
+            Ok(affected)
+        }
+    }
 }
 
 fn titlecase(s: &str) -> String {

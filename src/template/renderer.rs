@@ -173,7 +173,8 @@ impl ElementRenderer {
                     out.push_str("<div class=\"admonition-title\">");
                 }
 
-                out.push_str(&format!("<span class=\"admonition-icon admonition-icon-{}\"></span>", kind_clean));
+                let icon_svg = crate::plugins::admonitions::callout_icon_svg(&kind_clean);
+                out.push_str(&format!("<span class=\"admonition-title-icon\">{}</span>", icon_svg));
                 
                 let title_text = title.as_deref().unwrap_or(kind.as_str());
                 out.push_str(&format!(

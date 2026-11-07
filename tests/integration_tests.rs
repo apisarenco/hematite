@@ -73,12 +73,13 @@ tags: [core, arch]
 
 # Overview
 
-See [[Networking]] and [[Security|Secure Tunnel]].
+See [[Networking]] and [[Security|Secure Tunnel]] and [[Fighter#Extra Attack (Level 5)|Extra Attack]].
 "#;
 
     let catalog = vec![
         ("/docs/system/networking".to_string(), "docs/system/networking.md".to_string(), "Networking Setup".to_string()),
         ("/security/secure-tunnel".to_string(), "security/Security.md".to_string(), "Security System".to_string()),
+        ("/classes/fighter".to_string(), "06_rules/Classes/Fighter.md".to_string(), "Fighter Class".to_string()),
     ];
 
     let resolver = |source_url: &str, target_raw: &str| -> (String, Option<String>) {
@@ -93,10 +94,13 @@ See [[Networking]] and [[Security|Secure Tunnel]].
     assert_eq!(parsed.title, "System Architecture");
     assert!(parsed.links.contains(&"Networking".to_string()));
     assert!(parsed.links.contains(&"Security".to_string()));
+    assert!(parsed.links.contains(&"Fighter".to_string()));
     assert!(parsed.html.contains("/docs/system/networking"));
     assert!(parsed.html.contains("/security/secure-tunnel"));
     assert!(parsed.html.contains("Networking Setup")); // uses resolved page title when no display text
     assert!(parsed.html.contains("Secure Tunnel")); // uses explicit display text pipe
+    assert!(parsed.html.contains(r#"href="/classes/fighter#extra-attack-level-5""#));
+    assert!(parsed.html.contains(">Extra Attack</a>"));
 }
 
 #[test]
@@ -201,6 +205,13 @@ fn test_wikilink_resolver() {
 
     let resolved_file_no_ext = resolve_target("/02-party-knowledge/01-sessions/Session-Log-s", "Session 14-s", &session_pages);
     assert_eq!(resolved_file_no_ext, Some(("/02-party-knowledge/01-sessions/Session-14-s".to_string(), "Session 14".to_string())));
+
+    // Wikilink with anchor / heading [[Fighter#Extra Attack (Level 5)]]
+    let fighter_pages = vec![
+        ("/classes/fighter".to_string(), "06_rules/Classes/Fighter.md".to_string(), "Fighter".to_string()),
+    ];
+    let resolved_anchor = resolve_target("/characters/muk", "Fighter#Extra Attack (Level 5)", &fighter_pages);
+    assert_eq!(resolved_anchor, Some(("/classes/fighter#extra-attack-level-5".to_string(), "Fighter".to_string())));
 }
 
 #[test]
@@ -406,6 +417,7 @@ return entity
         content_root: content_dir.clone(),
         config: std::sync::Arc::new(config),
         theme_dir: temp_dir.join("themes/default"),
+        reconciler_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
 
     let app = hematite::server::create_router(state.clone());
@@ -485,6 +497,7 @@ async fn test_status_404_and_403_templates() {
         content_root: content_dir.clone(),
         config,
         theme_dir: temp_dir.join("themes/default"),
+        reconciler_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
 
     let app = hematite::server::create_router(state.clone());
@@ -536,30 +549,47 @@ async fn test_status_404_and_403_templates() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 #[tokio::test]
-async fn test_bemm_theme_features_and_overrides() {
+async fn test_custom_theme_features_and_overrides() {
     use std::fs;
     use tower::ServiceExt;
 
-    let temp_dir = std::env::temp_dir().join(format!("hematite_test_bemm_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let temp_dir = std::env::temp_dir().join(format!("hematite_test_theme_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     let content_dir = temp_dir.join("content");
     let themes_dir = temp_dir.join("themes");
-    let bemm_dir = themes_dir.join("bemm");
+    let mock_theme_dir = themes_dir.join("bemm");
+    let mock_templates_dir = mock_theme_dir.join("templates");
+    let mock_static_img_dir = mock_theme_dir.join("static/img");
     let db_path = temp_dir.join("test.db");
     fs::create_dir_all(&content_dir).unwrap();
-    fs::create_dir_all(&bemm_dir).unwrap();
+    fs::create_dir_all(&mock_templates_dir).unwrap();
+    fs::create_dir_all(&mock_static_img_dir).unwrap();
 
-    // Copy bemm theme into test themes dir
-    let project_bemm = std::path::Path::new("themes/bemm");
-    for entry in walkdir::WalkDir::new(project_bemm).into_iter().flatten() {
-        let p = entry.path();
-        let rel = p.strip_prefix(project_bemm).unwrap();
-        let dest = bemm_dir.join(rel);
-        if p.is_dir() {
-            fs::create_dir_all(&dest).unwrap();
-        } else {
-            fs::copy(p, &dest).unwrap();
-        }
-    }
+    // Create self-contained mock theme files (templates + static assets)
+    fs::write(
+        mock_static_img_dir.join("staff.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4"/></svg>"#,
+    )
+    .unwrap();
+
+    let mock_page_html = r#"<!DOCTYPE html>
+<html>
+<head><title>{{ title }} - {{ config.name }}</title></head>
+<body data-theme="{{ config.theme }}">
+    <header>{{ config.name }}</header>
+    <div class="tags-section">
+        <div class="tags-section-header">Arcane Tags</div>
+        {% for t in tags %}<span>{{ t }}</span>{% endfor %}
+    </div>
+    <div class="user-panel">
+        <span class="user-name">{{ user.username }}</span>
+    </div>
+    {% if not is_search_page and title %}
+    <h1 class="page-title-header" id="page-primary-title">{{ title }}</h1>
+    {% endif %}
+    <article class="prose" id="region-content">{{ content_html | safe }}</article>
+</body>
+</html>"#;
+    fs::write(mock_templates_dir.join("page.html"), mock_page_html).unwrap();
 
     // 1. Create markdown with frontmatter tags and H1
     let md = r#"---
@@ -582,6 +612,7 @@ This is the content of the quest.
     let mut config = hematite::config::HematiteConfig::default();
     config.theme = "bemm".to_string();
     config.name = "Bemm Realm".to_string();
+    config.anonymous_user_display = "Mysterious Wanderer".to_string();
 
     let crawler = std::sync::Arc::new(hematite::crawler::Crawler::new(
         content_dir.clone(),
@@ -601,7 +632,7 @@ This is the content of the quest.
         conn.execute("INSERT INTO acls (username, verb, path_pattern, priority) VALUES ('*', 'ALLOW', '/**', 0);", []).unwrap();
     }
 
-    let template_engine = std::sync::Arc::new(hematite::template::TemplateEngine::with_theme_override(Some(&bemm_dir)).unwrap());
+    let template_engine = std::sync::Arc::new(hematite::template::TemplateEngine::with_theme_override(Some(&mock_theme_dir)).unwrap());
     let auth_manager = std::sync::Arc::new(AuthManager::new("secret-key-12345678901234567890"));
     let initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
@@ -614,12 +645,13 @@ This is the content of the quest.
         initialized,
         content_root: content_dir.clone(),
         config: std::sync::Arc::new(config),
-        theme_dir: bemm_dir.clone(),
+        theme_dir: mock_theme_dir.clone(),
+        reconciler_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
 
     let app = hematite::server::create_router(state);
 
-    // Test static asset serve from theme override (e.g. staff.svg or app.css)
+    // Test static asset serve from theme override (e.g. staff.svg)
     let req_static = axum::http::Request::builder()
         .uri("/_static/img/staff.svg")
         .body(axum::body::Body::empty())
@@ -627,7 +659,7 @@ This is the content of the quest.
     let resp_static = app.clone().oneshot(req_static).await.unwrap();
     assert_eq!(resp_static.status(), axum::http::StatusCode::OK);
 
-    // Test SSR render with bemm theme
+    // Test SSR render with mock theme
     let req_ssr = axum::http::Request::builder()
         .uri("/chalice")
         .body(axum::body::Body::empty())
@@ -637,7 +669,7 @@ This is the content of the quest.
     let body_bytes = axum::body::to_bytes(resp_ssr.into_body(), usize::MAX).await.unwrap();
     let body_str = String::from_utf8_lossy(&body_bytes);
 
-    // Check bemm elements
+    // Check theme elements and anonymous_user_display config
     assert!(body_str.contains("Bemm Realm"));
     assert!(body_str.contains("Arcane Tags"));
     assert!(body_str.contains("Adventure"));
@@ -656,7 +688,7 @@ This is the content of the quest.
     let resp_search = app.oneshot(req_search).await.unwrap();
     assert_eq!(resp_search.status(), axum::http::StatusCode::OK);
     let search_bytes = axum::body::to_bytes(resp_search.into_body(), usize::MAX).await.unwrap();
-    let search_str = String::from_utf8_lossy(&search_bytes);
+    let _search_str = String::from_utf8_lossy(&search_bytes);
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
@@ -754,6 +786,7 @@ title: "Testing AST Elements"
         content_root: content_dir.clone(),
         config: std::sync::Arc::new(config),
         theme_dir,
+        reconciler_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
 
     let app = hematite::server::create_router(state);
@@ -868,5 +901,95 @@ async fn test_reconciliation_worker_background_render() {
 
     assert!(converged, "Reconciliation worker successfully updated page with new template override");
     rec_handle.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_invalidate_page_cache() {
+    use std::fs;
+    let temp_dir = std::env::temp_dir().join(format!("hematite_test_invalidate_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let content_dir = temp_dir.join("content");
+    let db_path = temp_dir.join("test.db");
+    fs::create_dir_all(&content_dir).unwrap();
+
+    let (writer, _handle) = hematite::db::DbActor::spawn(&db_path, &content_dir, 64).unwrap();
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path);
+    let pool = r2d2::Pool::builder().max_size(4).build(manager).unwrap();
+
+    let page1 = hematite::db::actor::PageRecord {
+        url_path: "/doc1".to_string(),
+        file_path: "doc1.md".to_string(),
+        title: "Doc 1".to_string(),
+        parent_path: "".to_string(),
+        depth: 1,
+        is_dir_index: false,
+        content_hash: [1u8; 16],
+        frontmatter_json: "{}".to_string(),
+        parsed_html: "<p>Doc 1</p>".to_string(),
+        raw_content: "Doc 1".to_string(),
+        taxonomy: "".to_string(),
+        links: vec![],
+        ast_blob: vec![],
+        build_hash: [2u8; 16],
+    };
+    let page2 = hematite::db::actor::PageRecord {
+        url_path: "/doc2".to_string(),
+        file_path: "doc2.md".to_string(),
+        title: "Doc 2".to_string(),
+        parent_path: "".to_string(),
+        depth: 1,
+        is_dir_index: false,
+        content_hash: [3u8; 16],
+        frontmatter_json: "{}".to_string(),
+        parsed_html: "<p>Doc 2</p>".to_string(),
+        raw_content: "Doc 2".to_string(),
+        taxonomy: "".to_string(),
+        links: vec![],
+        ast_blob: vec![],
+        build_hash: [4u8; 16],
+    };
+    writer.upsert_page(page1).await.unwrap();
+    writer.upsert_page(page2).await.unwrap();
+
+    let conn = pool.get().unwrap();
+
+    // 1. Invalidate single page by url
+    let affected = hematite::crawler::invalidate_page_cache(&conn, Some("/doc1")).unwrap();
+    assert_eq!(affected, 1);
+
+    let doc1_hashes: (Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT content_hash, build_hash FROM pages WHERE url_path = '/doc1';",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(doc1_hashes.0, vec![0u8; 16]);
+    assert_eq!(doc1_hashes.1, vec![0u8; 16]);
+
+    // doc2 should be unaffected
+    let doc2_hashes: (Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT content_hash, build_hash FROM pages WHERE url_path = '/doc2';",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(doc2_hashes.0, vec![3u8; 16]);
+
+    // 2. Invalidate all pages
+    let affected_all = hematite::crawler::invalidate_page_cache(&conn, None).unwrap();
+    assert_eq!(affected_all, 2);
+
+    let doc2_hashes_after: (Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT content_hash, build_hash FROM pages WHERE url_path = '/doc2';",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(doc2_hashes_after.0, vec![0u8; 16]);
+    assert_eq!(doc2_hashes_after.1, vec![0u8; 16]);
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

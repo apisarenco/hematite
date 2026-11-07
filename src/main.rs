@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::net::SocketAddr;
@@ -22,6 +22,9 @@ pub mod watcher;
 #[derive(Parser, Debug)]
 #[command(name = "hematite", author, version, about = "High-Performance Rust Markdown CMS")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     #[arg(short, long, default_value = "./content", env = "HEMATITE_CONTENT_DIR")]
     content: PathBuf,
 
@@ -31,7 +34,7 @@ struct Cli {
     #[arg(short, long, default_value = "hematite.db", env = "HEMATITE_DB_PATH")]
     database: PathBuf,
 
-    #[arg(short, long, env = "HEMATITE_CONFIG_PATH")]
+    #[arg(short = 'C', long, env = "HEMATITE_CONFIG_PATH")]
     config: Option<PathBuf>,
 
     #[arg(long, default_value = "./themes", env = "HEMATITE_THEMES_DIR")]
@@ -44,11 +47,108 @@ struct Cli {
     jwt_secret: String,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Invalidate page cache to force a full re-parse and reconciliation
+    InvalidateCache {
+        #[arg(short, long, default_value = "hematite.db", env = "HEMATITE_DB_PATH")]
+        database: Option<PathBuf>,
+
+        /// Invalidate a specific page by url_path or file_path pattern (omit to invalidate all pages)
+        #[arg(short, long)]
+        path: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+
+    // Handle subcommands
+    if let Some(Commands::InvalidateCache { database, path }) = cli.command {
+        let db_path = database.unwrap_or(cli.database);
+        if !db_path.exists() {
+            eprintln!("Error: Database file does not exist at {}", db_path.display());
+            return Ok(());
+        }
+        println!("Invalidating page cache in database: {}", db_path.display());
+
+        let mut conn = rusqlite::Connection::open(&db_path)?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        let _ = conn.pragma_update(None, "busy_timeout", 5000);
+
+        // Ensure schema is up to date before querying
+        let _ = db::migrations::run_migrations(&mut conn);
+
+        let count = match crawler::invalidate_page_cache(&conn, path.as_deref()) {
+            Ok(affected) => {
+                if let Some(ref target) = path {
+                    println!("Successfully invalidated {affected} page(s) matching '{target}'.");
+                } else {
+                    println!("Successfully invalidated all {affected} page(s).");
+                }
+                affected
+            }
+            Err(e) => {
+                eprintln!("Error invalidating page cache: {e}");
+                return Err(Box::<dyn std::error::Error>::from(e));
+            }
+        };
+
+        if count == 0 {
+            eprintln!("Warning: No matching pages were found in the database.");
+            return Ok(());
+        }
+
+        // Trigger automatic sweep immediately
+        println!("Starting automatic crawler sweep across content directory...");
+        let config = Arc::new(config::HematiteConfig::load_or_default(
+            cli.config.as_deref(),
+            Some(&cli.content),
+        ));
+        let (writer_handle, _actor_join) = db::DbActor::spawn(&db_path, &cli.content, 256)?;
+        let mut plugin_registry = plugin::PluginRegistry::new();
+        plugins::register_all(&mut plugin_registry);
+        let md_engine = markdown::MarkdownEngine::new(Arc::new(plugin_registry));
+        let script_engine = scripts::ScriptEngine::new(&cli.scripts);
+        let crawler = crawler::Crawler::new(
+            cli.content.clone(),
+            md_engine,
+            writer_handle.clone(),
+            script_engine,
+            (*config).clone(),
+        );
+
+        let existing_hashes = {
+            let mut map = std::collections::HashMap::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT file_path, content_hash FROM pages;") {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                }) {
+                    for r in rows.flatten() {
+                        map.insert(r.0, r.1);
+                    }
+                }
+            }
+            map
+        };
+
+        if let Err(e) = crawler.initial_sync(existing_hashes).await {
+            eprintln!("Automatic sweep failed: {e}");
+            return Err(e);
+        }
+
+        // Recompute build hash and update system_meta
+        let target_build_hash = crawler::reconciler::compute_build_hash(&cli.themes, &config.theme, &cli.scripts);
+        let _ = writer_handle.set_system_meta("current_build_hash".to_string(), target_build_hash.to_vec()).await;
+
+        println!("Automatic sweep completed successfully. All invalidated pages have been re-parsed and persisted.");
+        return Ok(());
+    }
+
     info!("Starting Hematite CMS daemon...");
 
     // 0. Load Configuration (hematite.yaml)
@@ -238,6 +338,7 @@ title: Features
         content_root: cli.content.clone(),
         config: config.clone(),
         theme_dir: theme_dir.clone(),
+        reconciler_notify: reconciler_notify.clone(),
     };
 
     let router = server::create_router(state);

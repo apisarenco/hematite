@@ -159,7 +159,12 @@ impl MarkdownEngine {
                         let actual_end = start_idx + 2 + end_idx;
                         let inner = &remainder[start_idx + 2..actual_end];
                         let target = inner.split_once('|').map(|(t, _)| t).unwrap_or(inner).trim();
-                        links.push(target.to_string());
+                        let target_doc = target.split_once('#').map(|(doc, _)| doc).unwrap_or(target).trim();
+                        if !target_doc.is_empty() {
+                            links.push(target_doc.to_string());
+                        } else if !target.is_empty() {
+                            links.push(target.to_string());
+                        }
                         remainder = &remainder[actual_end + 2..];
                     } else {
                         break;

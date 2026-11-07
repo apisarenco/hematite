@@ -67,6 +67,7 @@ flowchart TD
   - `name`: Site brand/title.
   - `base_url`: Base canonical URL for canonical tags, sitemaps, and feeds.
   - `theme`: Active theme directory under `./themes/<theme_name>`.
+  - `anonymous_user_display`: Display name for unauthenticated users (defaults to `"Anonymous"`).
 - **Free-Form Attributes**: Arbitrary extra YAML keys (e.g. `campaign`, `edition`, `author`) are deserialized and exposed directly to Minijinja templates (`config.<key>`) as well as Lua and Rhai extensibility hooks (`config.<key>`).
 
 ### 2.2 Ingestion, Crawling & SQLite Single-Writer Architecture

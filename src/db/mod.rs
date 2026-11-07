@@ -48,6 +48,12 @@ impl DbActor {
                         let _ = resp.send(res.map_err(|e| e.to_string()));
                     }
                 }
+                DbWriteCommand::UpsertPagesBatch { pages, resp } => {
+                    let res = self.handle_upsert_pages_batch(pages);
+                    if let Some(resp) = resp {
+                        let _ = resp.send(res.map_err(|e| e.to_string()));
+                    }
+                }
                 DbWriteCommand::RemoveFile { file_path, resp } => {
                     let res = self.handle_remove_file(&file_path);
                     if let Some(resp) = resp {
@@ -177,6 +183,76 @@ impl DbActor {
                 "INSERT OR IGNORE INTO page_links (source_url, target_raw, resolved_url) VALUES (?1, ?2, NULL);",
                 params![page.url_path, target],
             );
+        }
+
+        tx.commit()?;
+        self.resolve_links()?;
+        self.handle_rebuild_directories()?;
+        Ok(())
+    }
+
+    fn handle_upsert_pages_batch(&mut self, pages: Vec<PageRecord>) -> Result<(), rusqlite::Error> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let tx = self.conn.transaction()?;
+
+        {
+            let mut upsert_stmt = tx.prepare(
+                r#"INSERT INTO pages (
+                    url_path, file_path, title, parent_path, depth,
+                    is_dir_index, content_hash, frontmatter_json,
+                    parsed_html, ast_blob, build_hash, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                ON CONFLICT(url_path) DO UPDATE SET
+                    file_path = excluded.file_path,
+                    title = excluded.title,
+                    parent_path = excluded.parent_path,
+                    depth = excluded.depth,
+                    is_dir_index = excluded.is_dir_index,
+                    content_hash = excluded.content_hash,
+                    frontmatter_json = excluded.frontmatter_json,
+                    parsed_html = excluded.parsed_html,
+                    ast_blob = excluded.ast_blob,
+                    build_hash = excluded.build_hash,
+                    updated_at = excluded.updated_at"#,
+            )?;
+
+            let mut fts_del_stmt = tx.prepare("DELETE FROM pages_fts WHERE url_path = ?1;")?;
+            let mut fts_ins_stmt = tx.prepare("INSERT INTO pages_fts (url_path, title, content, taxonomy) VALUES (?1, ?2, ?3, ?4);")?;
+            let mut links_del_stmt = tx.prepare("DELETE FROM page_links WHERE source_url = ?1;")?;
+            let mut links_ins_stmt = tx.prepare("INSERT OR IGNORE INTO page_links (source_url, target_raw, resolved_url) VALUES (?1, ?2, NULL);")?;
+
+            for page in pages {
+                upsert_stmt.execute(params![
+                    page.url_path,
+                    page.file_path,
+                    page.title,
+                    page.parent_path,
+                    page.depth,
+                    if page.is_dir_index { 1 } else { 0 },
+                    page.content_hash.as_slice(),
+                    page.frontmatter_json,
+                    page.parsed_html,
+                    page.ast_blob.as_slice(),
+                    page.build_hash.as_slice(),
+                    now,
+                ])?;
+
+                fts_del_stmt.execute(params![page.url_path])?;
+                fts_ins_stmt.execute(params![page.url_path, page.title, page.raw_content, page.taxonomy])?;
+
+                links_del_stmt.execute(params![page.url_path])?;
+                for target in page.links {
+                    let _ = links_ins_stmt.execute(params![page.url_path, target]);
+                }
+            }
         }
 
         tx.commit()?;
@@ -524,10 +600,25 @@ pub fn resolve_target(
     target_raw: &str,
     pages: &[(String, String, String)],
 ) -> Option<(String, String)> {
-    let clean_raw = target_raw
+    let (target_doc, anchor) = match target_raw.split_once('#') {
+        Some((doc, h)) => (doc.trim(), Some(h.trim())),
+        None => (target_raw.trim(), None),
+    };
+
+    let anchor_suffix = anchor
+        .map(|h| crate::markdown::ast::slugify_heading(h))
+        .filter(|slug| !slug.is_empty())
+        .map(|slug| format!("#{slug}"))
+        .unwrap_or_default();
+
+    if target_doc.is_empty() {
+        return Some((format!("{source_url}{anchor_suffix}"), "".to_string()));
+    }
+
+    let clean_raw = target_doc
         .strip_suffix(".md")
-        .or_else(|| target_raw.strip_suffix(".markdown"))
-        .unwrap_or(target_raw);
+        .or_else(|| target_doc.strip_suffix(".markdown"))
+        .unwrap_or(target_doc);
 
     let clean_target = if clean_raw.starts_with('/') {
         crate::crawler::normalize_slug_path(clean_raw)
@@ -537,7 +628,7 @@ pub fn resolve_target(
 
     for (url, _, title) in pages {
         if url == &clean_target || url.trim_end_matches('/') == clean_target.trim_end_matches('/') {
-            return Some((url.clone(), title.clone()));
+            return Some((format!("{url}{anchor_suffix}"), title.clone()));
         }
     }
 
@@ -550,15 +641,15 @@ pub fn resolve_target(
     let sibling_candidate = crate::crawler::normalize_slug_path(&format!("{source_dir}/{}", clean_raw.trim_matches('/')));
     for (url, _, title) in pages {
         if url == &sibling_candidate {
-            return Some((url.clone(), title.clone()));
+            return Some((format!("{url}{anchor_suffix}"), title.clone()));
         }
     }
 
     // 3. Exact filename match (e.g. "Session 14-s.md" or "Session 14-s" matching file_path basename)
-    let target_filename = target_raw
+    let target_filename = target_doc
         .split('/')
         .last()
-        .unwrap_or(target_raw);
+        .unwrap_or(target_doc);
     let target_stem = target_filename
         .strip_suffix(".md")
         .or_else(|| target_filename.strip_suffix(".markdown"))
@@ -574,7 +665,7 @@ pub fn resolve_target(
         if actual_stem.eq_ignore_ascii_case(target_stem)
             || actual_file_name.eq_ignore_ascii_case(target_filename)
         {
-            return Some((url.clone(), title.clone()));
+            return Some((format!("{url}{anchor_suffix}"), title.clone()));
         }
     }
 
@@ -589,7 +680,7 @@ pub fn resolve_target(
             .unwrap_or("");
         let fname_slug = crate::crawler::slugify_segment(fname).to_lowercase();
         if fname_slug == target_slug {
-            matches.push((url.clone(), title.clone()));
+            matches.push((format!("{url}{anchor_suffix}"), title.clone()));
         }
     }
 

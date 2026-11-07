@@ -15,6 +15,9 @@ pub struct HematiteConfig {
     #[serde(default = "default_theme")]
     pub theme: String,
 
+    #[serde(default = "default_anonymous_user_display")]
+    pub anonymous_user_display: String,
+
     #[serde(flatten, default)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -31,12 +34,17 @@ fn default_theme() -> String {
     "default".to_string()
 }
 
+fn default_anonymous_user_display() -> String {
+    "Anonymous".to_string()
+}
+
 impl Default for HematiteConfig {
     fn default() -> Self {
         Self {
             name: default_name(),
             base_url: default_base_url(),
             theme: default_theme(),
+            anonymous_user_display: default_anonymous_user_display(),
             extra: HashMap::new(),
         }
     }
@@ -115,6 +123,7 @@ impl HematiteConfig {
                 "name": self.name,
                 "base_url": self.base_url,
                 "theme": self.theme,
+                "anonymous_user_display": self.anonymous_user_display,
             })
         })
     }

@@ -25,6 +25,10 @@ pub enum DbWriteCommand {
         page: Box<PageRecord>,
         resp: Option<oneshot::Sender<Result<(), String>>>,
     },
+    UpsertPagesBatch {
+        pages: Vec<PageRecord>,
+        resp: Option<oneshot::Sender<Result<(), String>>>,
+    },
     RemoveFile {
         file_path: PathBuf,
         resp: Option<oneshot::Sender<Result<(), String>>>,
@@ -88,6 +92,21 @@ impl DbWriterHandle {
         self.tx
             .send(DbWriteCommand::UpsertPage {
                 page: Box::new(page),
+                resp: Some(resp_tx),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        resp_rx.await.map_err(|e| e.to_string())?
+    }
+
+    pub async fn upsert_pages_batch(&self, pages: Vec<PageRecord>) -> Result<(), String> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(DbWriteCommand::UpsertPagesBatch {
+                pages,
                 resp: Some(resp_tx),
             })
             .await

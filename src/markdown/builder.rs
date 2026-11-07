@@ -467,19 +467,33 @@ fn try_convert_callout(children: &mut Vec<BlockNode>) -> Option<BlockNode> {
                         let mut collapsible = false;
                         let mut open = false;
 
-                        if kind.ends_with('+') {
+                        let after_bracket = trimmed[closing + 1..].trim();
+                        let (after_modifier, had_mod) = if after_bracket.starts_with('+') {
                             collapsible = true;
                             open = true;
-                            kind.pop();
-                        } else if kind.ends_with('-') {
+                            (after_bracket[1..].trim(), true)
+                        } else if after_bracket.starts_with('-') {
                             collapsible = true;
                             open = false;
-                            kind.pop();
+                            (after_bracket[1..].trim(), true)
+                        } else {
+                            (after_bracket, false)
+                        };
+
+                        if !had_mod {
+                            if kind.ends_with('+') {
+                                collapsible = true;
+                                open = true;
+                                kind.pop();
+                            } else if kind.ends_with('-') {
+                                collapsible = true;
+                                open = false;
+                                kind.pop();
+                            }
                         }
 
-                        let after_bracket = trimmed[closing + 1..].trim();
-                        let custom_title = if !after_bracket.is_empty() {
-                            Some(after_bracket.to_string())
+                        let custom_title = if !after_modifier.is_empty() {
+                            Some(after_modifier.to_string())
                         } else {
                             None
                         };

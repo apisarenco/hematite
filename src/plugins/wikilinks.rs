@@ -190,23 +190,39 @@ impl MarkdownPlugin for PluginInstance {
                                 events.push(Event::End(TagEnd::Link));
                             }
                         } else {
-                            // Standard Wikilink [[Target|Display]]
-                            let (target, display) = match inner.split_once('|') {
+                            // Standard Wikilink [[Target|Display]] or [[Target#Heading|Display]] or [[#Heading|Display]]
+                            let (target_full, display) = match inner.split_once('|') {
                                 Some((t, d)) => (t.trim(), Some(d.trim())),
                                 None => (inner.trim(), None),
                             };
 
-                            let (link_url, resolved_title) = if let Some(resolver) = ctx.link_resolver {
-                                let curr = ctx.current_url.unwrap_or("/");
-                                resolver(curr, target)
-                            } else {
-                                (crate::crawler::normalize_slug_path(target), None)
+                            let (target_doc, anchor) = match target_full.split_once('#') {
+                                Some((doc, heading)) => (doc.trim(), Some(heading.trim())),
+                                None => (target_full, None),
                             };
+
+                            let (mut link_url, resolved_title) = if target_doc.is_empty() {
+                                // Anchor on the current page, e.g. [[#Heading]]
+                                ("".to_string(), None)
+                            } else if let Some(resolver) = ctx.link_resolver {
+                                let curr = ctx.current_url.unwrap_or("/");
+                                resolver(curr, target_doc)
+                            } else {
+                                (crate::crawler::normalize_slug_path(target_doc), None)
+                            };
+
+                            if let Some(h) = anchor {
+                                let anchor_slug = crate::markdown::ast::slugify_heading(h);
+                                if !anchor_slug.is_empty() {
+                                    link_url.push('#');
+                                    link_url.push_str(&anchor_slug);
+                                }
+                            }
 
                             let display_text = display
                                 .map(|d| d.to_string())
                                 .or(resolved_title)
-                                .unwrap_or_else(|| target.to_string());
+                                .unwrap_or_else(|| target_full.to_string());
 
                             events.push(Event::Start(Tag::Link {
                                 link_type: pulldown_cmark::LinkType::Inline,

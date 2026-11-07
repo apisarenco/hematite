@@ -193,6 +193,26 @@ cargo run --release -- \
   --bind 0.0.0.0:3000
 ```
 
+#### Cache Invalidation & Force Re-parsing
+To clear the parsed page cache and force a complete re-parse and reconciliation of documents:
+
+```bash
+# Invalidate all pages in the database
+hematite invalidate-cache --database /data/hematite.db
+
+# Invalidate a specific page or directory pattern (by url_path or file_path)
+hematite invalidate-cache --database /data/hematite.db --path "/03-player-knowledge/Muk"
+
+# When running in Docker
+docker exec -it hematite hematite invalidate-cache --database /data/hematite.db
+
+# When running in Docker (invalidate specific path)
+docker exec -it hematite hematite invalidate-cache --database /data/hematite.db --path "/03-player-knowledge/Muk"
+```
+
+> [!TIP]
+> Cache invalidation resets the stored content and build hashes without deleting page links, ACLs, or user records. The background crawler and reconciliation loop will immediately pick up and re-parse the affected markdown files on next sync or request.
+
 ---
 
 ### 3. Configuration (`hematite.yaml`)
@@ -203,6 +223,7 @@ Place a `hematite.yaml` at the root of your project:
 name: "Aethelgard Wiki"
 base_url: "https://wiki.example.com"
 theme: "bemm"
+anonymous_user_display: "Mysterious Wanderer"
 
 # Arbitrary free-form variables accessible in templates & scripts:
 campaign: "The Silver Crusade"
