@@ -993,3 +993,62 @@ async fn test_invalidate_page_cache() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_database_version_and_migration() {
+    use hematite::db::migrations::{compare_semver, parse_semver, run_migrations, CURRENT_VERSION};
+    use rusqlite::Connection;
+
+    // Test semver parsing and comparison
+    assert_eq!(parse_semver("v0.0.3"), Some((0, 0, 3)));
+    assert_eq!(parse_semver("0.0.3"), Some((0, 0, 3)));
+    assert_eq!(parse_semver("v1.10.2"), Some((1, 10, 2)));
+    assert_eq!(compare_semver("v0.0.1", "v0.0.3"), std::cmp::Ordering::Less);
+    assert_eq!(compare_semver("v0.0.3", "v0.0.3"), std::cmp::Ordering::Equal);
+    assert_eq!(compare_semver("v0.1.0", "v0.0.9"), std::cmp::Ordering::Greater);
+
+    // Test fresh DB initialization
+    let mut conn = Connection::open_in_memory().unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    let db_ver: String = conn
+        .query_row("SELECT version FROM schema_version LIMIT 1;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(db_ver, CURRENT_VERSION);
+
+    // Verify all baseline tables exist
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table';")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    assert!(tables.contains(&"pages".to_string()));
+    assert!(tables.contains(&"directories".to_string()));
+    assert!(tables.contains(&"pages_fts".to_string()));
+    assert!(tables.contains(&"page_links".to_string()));
+    assert!(tables.contains(&"system_meta".to_string()));
+    assert!(tables.contains(&"users".to_string()));
+    assert!(tables.contains(&"acls".to_string()));
+    assert!(tables.contains(&"schema_version".to_string()));
+
+    // Verify ast_blob and build_hash exist in pages table
+    assert!(conn.prepare("SELECT ast_blob, build_hash FROM pages LIMIT 1;").is_ok());
+
+    // Test simulation of older version migration
+    conn.execute("DELETE FROM schema_version;", []).unwrap();
+    conn.execute(
+        "INSERT INTO schema_version (version, migrated_at) VALUES ('v0.0.1', 1000);",
+        [],
+    ).unwrap();
+
+    // Re-run migrations
+    run_migrations(&mut conn).unwrap();
+
+    let updated_ver: String = conn
+        .query_row("SELECT version FROM schema_version LIMIT 1;", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(updated_ver, CURRENT_VERSION);
+}

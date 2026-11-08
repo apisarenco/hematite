@@ -19,8 +19,11 @@ pub mod server;
 pub mod template;
 pub mod watcher;
 
+/// Current software version embedded at compile time (e.g. "v0.0.3").
+pub const VERSION: &str = env!("HEMATITE_VERSION");
+
 #[derive(Parser, Debug)]
-#[command(name = "hematite", author, version, about = "High-Performance Rust Markdown CMS")]
+#[command(name = "hematite", author, version = VERSION, about = "High-Performance Rust Markdown CMS")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

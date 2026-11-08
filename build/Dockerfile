@@ -1,14 +1,18 @@
 FROM rust:1.78-alpine AS builder
 
-RUN apk add --no-cache musl-dev gcc make sqlite-dev sqlite-static
+RUN apk add --no-cache musl-dev gcc make sqlite-dev sqlite-static git
 
 WORKDIR /build
+
+# Build argument for version injection
+ARG HEMATITE_VERSION
+ENV HEMATITE_VERSION=${HEMATITE_VERSION}
 
 # Cache dependency layer
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release || true
 
-# Copy source and custom plugins
+# Copy source, custom plugins, and .git if present
 COPY . .
 
 # Trigger re-generation via build.rs

@@ -81,6 +81,8 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            HEMATITE_VERSION=${{ steps.svu.outputs.version }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.svu.outputs.version }}
             ghcr.io/${{ github.repository }}:${{ steps.svu.outputs.version_minor }}

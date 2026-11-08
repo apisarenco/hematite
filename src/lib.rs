@@ -9,3 +9,7 @@ pub mod scripts;
 pub mod server;
 pub mod template;
 pub mod watcher;
+
+/// Current software version embedded at compile time (e.g. "v0.0.3").
+pub const VERSION: &str = env!("HEMATITE_VERSION");
+

@@ -3,6 +3,10 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 
+# Build argument for version injection
+ARG HEMATITE_VERSION
+ENV HEMATITE_VERSION=${HEMATITE_VERSION}
+
 # Cache dependencies
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release || true
@@ -12,6 +16,7 @@ COPY build.rs ./
 COPY src ./src
 COPY templates ./templates
 COPY static ./static
+COPY .git ./.git
 
 # Build release binary
 RUN touch build.rs && cargo build --release

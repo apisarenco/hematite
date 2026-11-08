@@ -1,8 +1,32 @@
 use rusqlite::{params, Connection};
+use std::cmp::Ordering;
 use std::path::Path;
 use tracing::info;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+/// Current software version embedded at compile time (e.g. "v0.0.3").
+pub const CURRENT_VERSION: &str = env!("HEMATITE_VERSION");
+
+/// Migration step definition.
+struct Migration {
+    /// The software version this migration upgrades from.
+    from_version: &'static str,
+    /// The software version this migration upgrades to.
+    to_version: &'static str,
+    /// The migration execution logic.
+    run: fn(&mut Connection) -> Result<(), rusqlite::Error>,
+}
+
+/// Registered sequential migrations.
+/// Note: Initial baseline DDL initializes the database up to the status quo at v0.0.3.
+/// Future migrations are appended here as versions evolve (e.g. from "v0.0.3" to "v0.0.4").
+static MIGRATIONS: &[Migration] = &[
+    // Example future migration:
+    // Migration {
+    //     from_version: "v0.0.3",
+    //     to_version: "v0.0.4",
+    //     run: migrate_v0_0_3_to_v0_0_4,
+    // },
+];
 
 pub fn initialize_database(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     // Enable WAL mode, synchronous=NORMAL, and foreign_keys=ON
@@ -20,92 +44,111 @@ pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection, rusqlite::
     Ok(conn)
 }
 
+/// Parse semantic version string like "v0.0.3" or "0.0.3" into (major, minor, patch).
+pub fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let s = v.trim().trim_start_matches(|c| c == 'v' || c == 'V');
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+pub fn compare_semver(a: &str, b: &str) -> Ordering {
+    match (parse_semver(a), parse_semver(b)) {
+        (Some(sa), Some(sb)) => sa.cmp(&sb),
+        _ => a.cmp(b),
+    }
+}
+
 pub fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    // Migration version table
+    // Schema version table storing the migrated semantic version string
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version (
-            version INTEGER NOT NULL PRIMARY KEY
+            version TEXT NOT NULL PRIMARY KEY,
+            migrated_at INTEGER NOT NULL
         );",
         [],
     )?;
 
-    let mut current_version: i32 = conn
-        .query_row("SELECT version FROM schema_version LIMIT 1;", [], |row| row.get(0))
-        .unwrap_or(0);
+    // Check last migrated version from DB
+    let last_version: Option<String> = conn
+        .query_row(
+            "SELECT version FROM schema_version ORDER BY ROWID DESC LIMIT 1;",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
 
-    info!(current_version, target_version = CURRENT_SCHEMA_VERSION, "Checking database migrations");
+    match last_version {
+        None => {
+            // Fresh database: apply the complete status quo DDL directly
+            info!(target_version = CURRENT_VERSION, "Fresh database detected, applying base schema");
+            apply_baseline_schema(conn)?;
+            set_migrated_version(conn, CURRENT_VERSION)?;
+            info!(version = CURRENT_VERSION, "Base schema applied successfully");
+        }
+        Some(ref last) if last != CURRENT_VERSION => {
+            info!(
+                from_version = last.as_str(),
+                to_version = CURRENT_VERSION,
+                "Database version differs from software version, checking migrations"
+            );
 
-    if current_version < 1 {
-        migrate_v1(conn)?;
-        current_version = 1;
-        conn.execute("DELETE FROM schema_version;", [])?;
-        conn.execute("INSERT INTO schema_version (version) VALUES (?1);", params![current_version])?;
-        info!("Applied migration v1");
-    }
+            let mut active_version = last.clone();
 
-    if current_version < 2 {
-        migrate_v2(conn)?;
-        current_version = 2;
-        conn.execute("DELETE FROM schema_version;", [])?;
-        conn.execute("INSERT INTO schema_version (version) VALUES (?1);", params![current_version])?;
-        info!("Applied migration v2");
-    }
+            for migration in MIGRATIONS {
+                // If the database is at migration.from_version or older and migration targets <= CURRENT_VERSION
+                if compare_semver(&active_version, migration.from_version) == Ordering::Equal
+                    || (compare_semver(&active_version, migration.from_version) == Ordering::Less
+                        && compare_semver(migration.to_version, CURRENT_VERSION) != Ordering::Greater)
+                {
+                    info!(
+                        from = migration.from_version,
+                        to = migration.to_version,
+                        "Running migration"
+                    );
+                    (migration.run)(conn)?;
+                    active_version = migration.to_version.to_string();
+                    set_migrated_version(conn, &active_version)?;
+                    info!(version = %active_version, "Completed migration step");
+                }
+            }
 
-    if current_version < 3 {
-        migrate_v3(conn)?;
-        current_version = 3;
-        conn.execute("DELETE FROM schema_version;", [])?;
-        conn.execute("INSERT INTO schema_version (version) VALUES (?1);", params![current_version])?;
-        info!("Applied migration v3");
+            // Finally update version in DB to current software version
+            set_migrated_version(conn, CURRENT_VERSION)?;
+            info!(
+                previous_version = last.as_str(),
+                current_version = CURRENT_VERSION,
+                "Database version successfully updated to software version"
+            );
+        }
+        Some(ref last) => {
+            info!(version = last.as_str(), "Database schema is up to date");
+        }
     }
 
     Ok(())
 }
 
-fn migrate_v3(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+fn set_migrated_version(conn: &mut Connection, version: &str) -> Result<(), rusqlite::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
     let tx = conn.transaction()?;
-
-    // Add ast_blob and build_hash to pages if they do not exist
-    let has_ast_blob: bool = tx
-        .prepare("SELECT ast_blob FROM pages LIMIT 1;")
-        .is_ok();
-    if !has_ast_blob {
-        tx.execute("ALTER TABLE pages ADD COLUMN ast_blob BLOB;", [])?;
-    }
-
-    let has_build_hash: bool = tx
-        .prepare("SELECT build_hash FROM pages LIMIT 1;")
-        .is_ok();
-    if !has_build_hash {
-        tx.execute("ALTER TABLE pages ADD COLUMN build_hash BLOB;", [])?;
-    }
-
-    // System metadata key-value table for tracking current_build_hash
+    tx.execute("DELETE FROM schema_version;", [])?;
     tx.execute(
-        "CREATE TABLE IF NOT EXISTS system_meta (
-            key TEXT PRIMARY KEY,
-            value BLOB NOT NULL
-        );",
-        [],
+        "INSERT INTO schema_version (version, migrated_at) VALUES (?1, ?2);",
+        params![version, now],
     )?;
-
     tx.commit()?;
     Ok(())
 }
 
-fn migrate_v2(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    let has_col: bool = conn
-        .prepare("SELECT title FROM directories LIMIT 1;")
-        .is_ok();
-    if !has_col {
-        let tx = conn.transaction()?;
-        tx.execute("ALTER TABLE directories ADD COLUMN title TEXT;", [])?;
-        tx.commit()?;
-    }
-    Ok(())
-}
-
-fn migrate_v1(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+/// Baseline DDL representing the current status quo of Hematite
+fn apply_baseline_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let tx = conn.transaction()?;
 
     tx.execute_batch(
@@ -121,6 +164,8 @@ fn migrate_v1(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             content_hash BLOB NOT NULL,         -- 16 bytes (xxh3_128)
             frontmatter_json TEXT NOT NULL DEFAULT '{}',
             parsed_html TEXT,                   -- Pre-rendered HTML cache
+            ast_blob BLOB,                      -- Serialized CBOR DocAst
+            build_hash BLOB,                    -- 16 bytes (xxh3_128) build hash for cache validation
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
@@ -152,6 +197,12 @@ fn migrate_v1(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             resolved_url TEXT,                  -- Resolved /path if matched
             PRIMARY KEY (source_url, target_raw),
             FOREIGN KEY (source_url) REFERENCES pages(url_path) ON DELETE CASCADE
+        );
+
+        -- System metadata key-value table for tracking current_build_hash and state
+        CREATE TABLE IF NOT EXISTS system_meta (
+            key TEXT PRIMARY KEY,
+            value BLOB NOT NULL
         );
 
         -- Users & Credentials
