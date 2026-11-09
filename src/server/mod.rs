@@ -659,11 +659,12 @@ async fn api_page(
 }
 
 // -------------------------------------------------------------
-// FTS5 Search Endpoint: GET /_api/v1/search?q=...
+// FTS5 Search Endpoint: GET /_api/v1/search?q=...&t=...
 // -------------------------------------------------------------
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SearchQuery {
-    q: String,
+    q: Option<String>,
+    t: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -673,9 +674,95 @@ struct SearchHit {
     snippet: String,
 }
 
+fn build_fts_content_query(raw: &str) -> Option<String> {
+    let tokens: Vec<String> = raw
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\"{}\"*", s))
+        .collect();
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(format!("{{title content}}:({})", tokens.join(" ")))
+    }
+}
+
+fn query_search_hits(
+    conn: &rusqlite::Connection,
+    q_param: Option<&str>,
+    t_param: Option<&str>,
+    limit: usize,
+) -> Result<Vec<SearchHit>, rusqlite::Error> {
+    let mut hits = Vec::new();
+
+    // 1. Tag search takes precedence if `t` parameter is provided and non-empty
+    if let Some(tag) = t_param.filter(|s| !s.trim().is_empty()) {
+        let tag_trimmed = tag.trim();
+        let mut stmt = conn.prepare(
+            "SELECT p.url_path, p.title, SUBSTR(COALESCE(f.content, ''), 1, 150)
+             FROM pages p
+             LEFT JOIN pages_fts f ON f.url_path = p.url_path
+             WHERE EXISTS (
+                 SELECT 1 FROM json_each(
+                     CASE 
+                         WHEN json_type(p.frontmatter_json, '$.tags') = 'array' 
+                             THEN json_extract(p.frontmatter_json, '$.tags')
+                         WHEN json_type(p.frontmatter_json, '$.tags') = 'text' 
+                             THEN json_array(json_extract(p.frontmatter_json, '$.tags'))
+                         ELSE json_array()
+                     END
+                 )
+                 WHERE LOWER(json_each.value) = LOWER(?1)
+             )
+             ORDER BY p.title ASC
+             LIMIT ?2;",
+        )?;
+
+        let rows = stmt.query_map(params![tag_trimmed, limit as i64], |row| {
+            Ok(SearchHit {
+                url: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            })
+        })?;
+
+        for r in rows.flatten() {
+            hits.push(r);
+        }
+        return Ok(hits);
+    }
+
+    // 2. Regular content & title full-text search (excluding taxonomy)
+    if let Some(query_str) = q_param.filter(|s| !s.trim().is_empty()) {
+        if let Some(fts_query) = build_fts_content_query(query_str) {
+            let mut stmt = conn.prepare(
+                "SELECT url_path, title, snippet(pages_fts, 2, '<b>', '</b>', '...', 25)
+                 FROM pages_fts
+                 WHERE pages_fts MATCH ?1
+                 LIMIT ?2;",
+            )?;
+
+            let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+                Ok(SearchHit {
+                    url: row.get(0)?,
+                    title: row.get(1)?,
+                    snippet: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                })
+            })?;
+
+            for r in rows.flatten() {
+                hits.push(r);
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
 async fn api_search(
     State(state): State<AppState>,
-    Query(q): Query<SearchQuery>,
+    Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<SearchHit>>, (StatusCode, String)> {
     let conn = state.db_pool.get().map_err(|e| {
         (
@@ -684,34 +771,20 @@ async fn api_search(
         )
     })?;
 
-    let cleaned = q.q.replace('"', "").replace('*', "");
-    let fts_query = format!("{}*", cleaned.trim());
-
-    let mut stmt = conn
-        .prepare("SELECT url_path, title, snippet(pages_fts, 2, '<b>', '</b>', '...', 15) FROM pages_fts WHERE pages_fts MATCH ?1 LIMIT 20;")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let rows = stmt
-        .query_map(params![fts_query], |row| {
-            Ok(SearchHit {
-                url: row.get(0)?,
-                title: row.get(1)?,
-                snippet: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            })
-        })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut hits = Vec::new();
-    for r in rows.flatten() {
-        hits.push(r);
-    }
+    let hits = query_search_hits(
+        &conn,
+        query.q.as_deref(),
+        query.t.as_deref(),
+        20,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(hits))
 }
 
 async fn search_page(
     State(state): State<AppState>,
-    Query(q): Query<SearchQuery>,
+    Query(query): Query<SearchQuery>,
     req: Request,
 ) -> Result<Response, (StatusCode, String)> {
     let conn = state.db_pool.get().map_err(|e| {
@@ -724,27 +797,22 @@ async fn search_page(
     let claims = extract_claims_from_request(&req, &state.auth_manager);
     let user_ctx = build_user_context(claims.as_ref(), &state.config);
 
-    let cleaned = q.q.replace('"', "").replace('*', "");
-    let fts_query = format!("{}*", cleaned.trim());
+    let hits = query_search_hits(
+        &conn,
+        query.q.as_deref(),
+        query.t.as_deref(),
+        50,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut hits = Vec::new();
-    if !cleaned.trim().is_empty() {
-        if let Ok(mut stmt) = conn.prepare("SELECT url_path, title, snippet(pages_fts, 2, '<b>', '</b>', '...', 25) FROM pages_fts WHERE pages_fts MATCH ?1 LIMIT 50;") {
-            if let Ok(rows) = stmt.query_map(params![fts_query], |row| {
-                Ok(SearchHit {
-                    url: row.get(0)?,
-                    title: row.get(1)?,
-                    snippet: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                })
-            }) {
-                for r in rows.flatten() {
-                    hits.push(r);
-                }
-            }
-        }
-    }
+    let is_tag_search = query.t.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let display_query = if is_tag_search {
+        format!("Tag: {}", query.t.as_deref().unwrap_or_default())
+    } else {
+        query.q.as_deref().unwrap_or_default().to_string()
+    };
 
-    let page_title = format!("Search: {}", q.q);
+    let page_title = format!("Search: {}", display_query);
     let (nav_html, _, _) = build_page_chrome(&conn, &state.template_engine, "/_search", &page_title);
 
     let search_content = state
@@ -752,13 +820,15 @@ async fn search_page(
         .render(
             "search.html",
             json!({
-                "query": q.q,
+                "query": display_query,
+                "tag": query.t,
+                "is_tag_search": is_tag_search,
                 "hits": hits,
                 "config": state.config.to_json_value(),
             }),
         )
         .or_else(|_| {
-            let mut out = format!("<h1>Search Results: {}</h1>", q.q);
+            let mut out = format!("<h1>Search Results: {}</h1>", display_query);
             if hits.is_empty() {
                 out.push_str("<p>No results found.</p>");
             } else {

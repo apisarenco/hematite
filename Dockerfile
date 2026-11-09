@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for running Hematite as UID 33 (www-data)
-FROM rust:1-bookworm AS builder
+FROM rust:1-trixie AS builder
 
 WORKDIR /build
 
@@ -22,7 +22,7 @@ COPY .git ./.git
 RUN touch build.rs && cargo build --release
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

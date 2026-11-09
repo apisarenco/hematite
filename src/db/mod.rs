@@ -550,7 +550,16 @@ impl DbActor {
         )?;
 
         // Update FTS
-        tx.execute("UPDATE pages_fts SET title = ?1 WHERE url_path = ?2;", params![entity.title, entity.url_path])?;
+        let fm_val: serde_json::Value = serde_json::from_str(&entity.frontmatter_json).unwrap_or(serde_json::Value::Null);
+        let taxonomy_str = if !entity.taxonomy.is_empty() {
+            entity.taxonomy
+        } else {
+            crate::crawler::extract_taxonomy_tags(&fm_val)
+        };
+        tx.execute(
+            "UPDATE pages_fts SET title = ?1, taxonomy = ?2 WHERE url_path = ?3;",
+            params![entity.title, taxonomy_str, entity.url_path],
+        )?;
 
         tx.commit()?;
         Ok(())

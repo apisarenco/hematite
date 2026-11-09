@@ -153,7 +153,7 @@ impl Crawler {
                 frontmatter_json: updated_fm_json,
                 parsed_html: parsed.html,
                 raw_content: parsed.raw_content,
-                taxonomy: String::new(),
+                taxonomy: extract_taxonomy_tags(&fm_val),
                 links: parsed.links,
                 ast_blob: parsed.ast_blob,
                 build_hash: [0u8; 16],
@@ -338,7 +338,7 @@ impl Crawler {
             frontmatter_json: updated_fm_json,
             parsed_html: parsed.html,
             raw_content: parsed.raw_content,
-            taxonomy: String::new(),
+            taxonomy: extract_taxonomy_tags(&fm_val),
             links: parsed.links,
             ast_blob: parsed.ast_blob,
             build_hash: [0u8; 16],
@@ -478,6 +478,23 @@ pub fn invalidate_page_cache(
             Ok(affected)
         }
     }
+}
+
+/// Helper to extract tags from frontmatter JSON and space-delimit them for FTS taxonomy column
+pub fn extract_taxonomy_tags(fm: &serde_json::Value) -> String {
+    let mut tags = Vec::new();
+    if let Some(tags_val) = fm.get("tags") {
+        if let Some(arr) = tags_val.as_array() {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    tags.push(s.to_string());
+                }
+            }
+        } else if let Some(s) = tags_val.as_str() {
+            tags.push(s.to_string());
+        }
+    }
+    tags.join(" ")
 }
 
 fn titlecase(s: &str) -> String {

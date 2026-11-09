@@ -6,7 +6,7 @@ document.addEventListener('click', async (e) => {
     const link = e.target.closest('a');
     if (!link) return;
     const href = link.getAttribute('href');
-    if (!href || href.startsWith('http:') || href.startsWith('https:') || href.startsWith('//') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('/_user') || href.startsWith('/_admin') || href.startsWith('/_static')) return;
+    if (!href || href.startsWith('http:') || href.startsWith('https:') || href.startsWith('//') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('/_user') || href.startsWith('/_admin') || href.startsWith('/_static') || href.startsWith('/_search')) return;
 
     // Use location.href as the base to resolve relative links and anchors correctly against current page
     const targetUrl = new URL(href, location.href);

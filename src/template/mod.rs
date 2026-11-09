@@ -19,6 +19,12 @@ impl TemplateEngine {
 
     pub fn with_theme_override(theme_dir: Option<&Path>) -> Result<Self, JinjaError> {
         let mut env = Environment::new();
+
+        // Custom filters
+        env.add_filter("urlencode", |value: &str| -> String {
+            urlencoding::encode(value).into_owned()
+        });
+
         // Register embedded default templates
         env.add_template("page.html", include_str!("../../templates/page.html"))?;
         env.add_template(

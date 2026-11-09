@@ -1052,3 +1052,155 @@ fn test_database_version_and_migration() {
         .unwrap();
     assert_eq!(updated_ver, CURRENT_VERSION);
 }
+
+#[tokio::test]
+async fn test_search_and_tag_parameter() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use hematite::config::HematiteConfig;
+    use hematite::crawler::Crawler;
+    use hematite::db::DbActor;
+    use hematite::markdown::MarkdownEngine;
+    use hematite::plugin::PluginRegistry;
+    use hematite::scripts::ScriptEngine;
+    use std::fs;
+    use tower::ServiceExt;
+
+    let temp_dir = std::env::temp_dir().join(format!("hematite_search_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let content_dir = temp_dir.join("content");
+    let scripts_dir = temp_dir.join("scripts");
+    let themes_dir = temp_dir.join("themes");
+    fs::create_dir_all(&content_dir).unwrap();
+    fs::create_dir_all(&scripts_dir).unwrap();
+    fs::create_dir_all(&themes_dir).unwrap();
+
+    let db_path = temp_dir.join("test.db");
+
+    // Page 1: Tagged "Session-Log" and "campaign", content mentions "dragon and dungeon"
+    let md1 = r#"---
+title: Session 1
+tags: [Session-Log, campaign]
+---
+In this adventure we encountered an ancient dragon.
+"#;
+    fs::write(content_dir.join("session1.md"), md1).unwrap();
+
+    // Page 2: Tagged "lore", content mentions "Session-Log notes"
+    let md2 = r#"---
+title: Realm Lore
+tags: [lore]
+---
+Here are some Session-Log notes for the realm archives.
+"#;
+    fs::write(content_dir.join("lore.md"), md2).unwrap();
+
+    let (writer, _) = DbActor::spawn(&db_path, &content_dir, 100).unwrap();
+    let reg = PluginRegistry::new();
+    let engine = MarkdownEngine::new(std::sync::Arc::new(reg));
+    let script_engine = ScriptEngine::new(&scripts_dir);
+    let config = HematiteConfig::default();
+
+    let crawler = std::sync::Arc::new(Crawler::new(
+        content_dir.clone(),
+        engine.clone(),
+        writer.clone(),
+        script_engine,
+        config.clone(),
+    ));
+    crawler.initial_sync(std::collections::HashMap::new()).await.unwrap();
+
+    // Give single-writer actor a brief moment to finish write batches
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path);
+    let pool = r2d2::Pool::builder().build(manager).unwrap();
+    {
+        let conn = pool.get().unwrap();
+        conn.execute("INSERT OR IGNORE INTO users (username, password_hash, role, token_version, created_at) VALUES ('*', '', 'anonymous', 1, 0);", []).unwrap();
+        conn.execute("INSERT INTO acls (username, verb, path_pattern, priority) VALUES ('*', 'ALLOW', '/**', 0);", []).unwrap();
+    }
+    let template_engine = std::sync::Arc::new(hematite::template::TemplateEngine::new().unwrap());
+    let auth_manager = std::sync::Arc::new(hematite::auth::AuthManager::new("secret-key-12345678901234567890"));
+    let initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let state = hematite::server::AppState {
+        db_pool: pool,
+        auth_manager,
+        template_engine,
+        crawler: crawler.clone(),
+        writer: writer.clone(),
+        initialized,
+        content_root: content_dir.clone(),
+        config: std::sync::Arc::new(config),
+        theme_dir: temp_dir.join("themes/default"),
+        reconciler_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    let app = hematite::server::create_router(state);
+
+    // 1. Tag search via API: /_api/v1/search?t=Session-Log should ONLY return session1.md, NOT lore.md
+    let req = Request::builder()
+        .uri("/_api/v1/search?t=Session-Log")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let hits_arr = hits.as_array().unwrap();
+    assert_eq!(hits_arr.len(), 1);
+    assert_eq!(hits_arr[0]["url"], "/session1");
+    assert_eq!(hits_arr[0]["title"], "Session 1");
+
+    // 2. Regular content search via API: /_api/v1/search?q=dragon should return session1.md
+    let req = Request::builder()
+        .uri("/_api/v1/search?q=dragon")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let hits_arr = hits.as_array().unwrap();
+    assert_eq!(hits_arr.len(), 1);
+    assert_eq!(hits_arr[0]["url"], "/session1");
+
+    // 3. Regular search for "campaign": "campaign" is only in tags of session1.md, not in content or title.
+    // Regular search should NOT match it since regular search focuses on {title content}, excluding taxonomy!
+    let req = Request::builder()
+        .uri("/_api/v1/search?q=campaign")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let hits_arr = hits.as_array().unwrap();
+    assert_eq!(hits_arr.len(), 0);
+
+    // 4. Tag search for "campaign" via t=campaign DOES find session1.md
+    let req = Request::builder()
+        .uri("/_api/v1/search?t=campaign")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let hits: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let hits_arr = hits.as_array().unwrap();
+    assert_eq!(hits_arr.len(), 1);
+    assert_eq!(hits_arr[0]["url"], "/session1");
+
+    // 5. HTML search page via /_search?t=Session-Log
+    let req = Request::builder()
+        .uri("/_search?t=Session-Log")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains("Session 1"));
+    assert!(html.contains("/session1"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
