@@ -248,6 +248,27 @@ img.align-center {
     clear: both;
 }
 
+/* ACL Inaccessible / Forbidden Links */
+a.acl-inaccessible,
+.prose a.acl-inaccessible,
+.nav-tree a.acl-inaccessible {
+    color: #8b3a3a !important;
+    text-decoration: line-through dotted 1px !important;
+    cursor: not-allowed !important;
+    opacity: 0.65;
+    pointer-events: none !important;
+    text-shadow: none !important;
+}
+
+a.acl-inaccessible:hover,
+.prose a.acl-inaccessible:hover,
+.nav-tree a.acl-inaccessible:hover {
+    color: #8b3a3a !important;
+    text-decoration: line-through dotted 1px !important;
+    text-shadow: none !important;
+}
+
+
 /* Obsidian Admonitions / Callouts */
 .admonition {
     margin: 1.25rem 0;

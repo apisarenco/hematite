@@ -49,6 +49,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/_user/login", get(login_page).post(login_action))
         .route("/_user/logout", get(logout_action))
         // Admin routes
+        .route("/_admin", get(admin_redirect_slash))
         .route("/_admin/", get(admin_page))
         .route("/_admin/users/create", post(admin_create_user))
         .route("/_admin/users/delete", post(admin_delete_user))
@@ -90,26 +91,6 @@ pub async fn verify_acl(
     // 2. Extract token from cookie or Authorization header
     let claims = extract_claims_from_request(&req, &state.auth_manager);
 
-    // 3. Admin routes require admin role & valid token version check
-    if path.starts_with("/_admin") {
-        match claims {
-            Some(ref c) if c.role == "admin" => {
-                if !verify_token_version(&state, &c.username, c.ver) {
-                    return Ok(Redirect::to("/_user/login").into_response());
-                }
-                return Ok(next.run(req).await);
-            }
-            Some(_) => {
-                let is_spa = path == "/_api/v1/page";
-                return Ok(render_status_response(&state, StatusCode::FORBIDDEN, &path, "You do not have administrative privileges to access this area.", is_spa));
-            }
-            None => {
-                let redirect_url = format!("/_user/login?redirect={}", urlencoding::encode(&path));
-                return Ok(Redirect::to(&redirect_url).into_response());
-            }
-        }
-    }
-
     // Determine target path for ACL check (for /_api/v1/page, evaluate target path param)
     let acl_target_path = if path == "/_api/v1/page" {
         req.uri()
@@ -125,14 +106,25 @@ pub async fn verify_acl(
         path.clone()
     };
 
+    let mut new_token_cookie = None;
     let (is_anon, rules) = match claims {
         Some(ref c) => {
-            // Verify token version in database
-            if !verify_token_version(&state, &c.username, c.ver) {
-                // Version mismatch! Invalidate and redirect to login
+            // Check if token version matches the database
+            if let Some((role, current_ver, latest_rules)) = get_user_latest_auth(&state, &c.username) {
+                if c.ver != current_ver {
+                    // Token version bumped! The old token is still valid for authentication,
+                    // but authorization uses the latest rules, and we issue a refreshed token.
+                    if let Ok(new_token) = state.auth_manager.create_jwt(&c.username, &role, current_ver, latest_rules.clone()) {
+                        new_token_cookie = Some(format!("jwt={}; Path=/; HttpOnly; SameSite=Lax", new_token));
+                    }
+                    (false, latest_rules)
+                } else {
+                    (false, c.acl.clone())
+                }
+            } else {
+                // User no longer exists in DB
                 return Ok(Redirect::to("/_user/login").into_response());
             }
-            (false, c.acl.clone())
         }
         None => {
             // Anonymous rules from database (rules assigned to '*' or anonymous)
@@ -147,10 +139,27 @@ pub async fn verify_acl(
             return Ok(Redirect::to(&redirect_url).into_response());
         }
         let is_spa = path == "/_api/v1/page";
-        return Ok(render_status_response(&state, StatusCode::FORBIDDEN, &acl_target_path, "You do not have permission to view this resource.", is_spa));
+        let msg = if acl_target_path.starts_with("/_admin") {
+            "You do not have administrative privileges to access this area."
+        } else {
+            "You do not have permission to view this resource."
+        };
+        let mut resp = render_status_response(&state, StatusCode::FORBIDDEN, &acl_target_path, msg, is_spa);
+        if let Some(cookie) = new_token_cookie {
+            if let Ok(val) = header::HeaderValue::from_str(&cookie) {
+                resp.headers_mut().insert(header::SET_COOKIE, val);
+            }
+        }
+        return Ok(resp);
     }
 
-    Ok(next.run(req).await)
+    let mut resp = next.run(req).await;
+    if let Some(cookie) = new_token_cookie {
+        if let Ok(val) = header::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().insert(header::SET_COOKIE, val);
+        }
+    }
+    Ok(resp)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,21 +168,27 @@ pub struct UserContext {
     pub username: String,
     pub role: String,
     pub is_admin: bool,
+    pub acl: Vec<AclRule>,
 }
 
-fn build_user_context(claims: Option<&Claims>, config: &HematiteConfig) -> UserContext {
+fn build_user_context(claims: Option<&Claims>, config: &HematiteConfig, default_rules: Vec<AclRule>) -> UserContext {
     match claims {
-        Some(c) => UserContext {
-            is_authenticated: true,
-            username: c.username.clone(),
-            role: c.role.clone(),
-            is_admin: c.role == "admin",
-        },
+        Some(c) => {
+            let is_admin = AclEngine::check_permission("/_admin/", &c.acl);
+            UserContext {
+                is_authenticated: true,
+                username: c.username.clone(),
+                role: c.role.clone(),
+                is_admin,
+                acl: c.acl.clone(),
+            }
+        }
         None => UserContext {
             is_authenticated: false,
             username: config.anonymous_user_display.clone(),
             role: "anonymous".to_string(),
             is_admin: false,
+            acl: default_rules,
         },
     }
 }
@@ -207,24 +222,36 @@ fn extract_claims_from_request(req: &Request, auth: &AuthManager) -> Option<Clai
     None
 }
 
-fn verify_token_version(state: &AppState, username: &str, token_version: i32) -> bool {
-    let conn = match state.db_pool.get() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    let db_version: Option<i32> = conn
+fn get_user_latest_auth(state: &AppState, username: &str) -> Option<(String, i32, Vec<AclRule>)> {
+    let conn = state.db_pool.get().ok()?;
+    let user_info: Option<(String, i32)> = conn
         .query_row(
-            "SELECT token_version FROM users WHERE username = ?1;",
+            "SELECT role, token_version FROM users WHERE username = ?1;",
             params![username],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok();
 
-    match db_version {
-        Some(v) => v == token_version,
-        None => false,
+    if let Some((role, ver)) = user_info {
+        let mut rules = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT verb, path_pattern FROM acls WHERE username = ?1 OR username = '*' ORDER BY priority ASC, id ASC;",
+        ) {
+            let rows = stmt.query_map(params![username], |r| {
+                Ok(AclRule {
+                    v: r.get(0)?,
+                    p: r.get(1)?,
+                })
+            });
+            if let Ok(r_iter) = rows {
+                for r in r_iter.flatten() {
+                    rules.push(r);
+                }
+            }
+        }
+        return Some((role, ver, rules));
     }
+    None
 }
 
 fn get_anonymous_rules(state: &AppState) -> Vec<AclRule> {
@@ -280,7 +307,9 @@ async fn ssr_handler(
         .ok();
 
     let claims = extract_claims_from_request(&req, &state.auth_manager);
-    let user_ctx = build_user_context(claims.as_ref(), &state.config);
+    let default_rules = get_anonymous_rules(&state);
+    let user_rules = claims.as_ref().map(|c| c.acl.clone()).unwrap_or_else(|| default_rules.clone());
+    let user_ctx = build_user_context(claims.as_ref(), &state.config, default_rules);
     let all_tags = get_all_distinct_tags(&conn);
 
     if let Some((title, fm_json, html, parent_path, ast_blob, build_hash, content_hash)) = page_query {
@@ -325,7 +354,7 @@ async fn ssr_handler(
             }
         }
 
-        let (nav_html, breadcrumbs_html, toc_html) = build_page_chrome(&conn, &state.template_engine, &normalized, &title);
+        let (nav_html, breadcrumbs_html, toc_html) = build_page_chrome(&conn, &state.template_engine, &normalized, &title, &user_rules);
         let fm_val: serde_json::Value =
             serde_json::from_str(&fm_json).unwrap_or(json!({}));
         let title_source = fm_val.get("title_source").and_then(|v| v.as_str()).unwrap_or("frontmatter").to_string();
@@ -421,13 +450,29 @@ async fn ssr_handler(
             subdirs.push(d);
         }
 
+        // Filter child pages and subdirectories by ACL permissions
+        child_pages.retain(|p| {
+            if let Some(u) = p.get("url_path").and_then(|v| v.as_str()) {
+                AclEngine::check_permission(u, &user_rules)
+            } else {
+                true
+            }
+        });
+        subdirs.retain(|d| {
+            if let Some(u) = d.get("url_path").and_then(|v| v.as_str()) {
+                AclEngine::check_permission(u, &user_rules)
+            } else {
+                true
+            }
+        });
+
         let dir_name = if normalized == "/" {
             "Home".to_string()
         } else {
             normalized.split('/').last().unwrap_or("Index").to_string()
         };
 
-        let (nav_html, breadcrumbs_html, _) = build_page_chrome(&conn, &state.template_engine, &normalized, &dir_name);
+        let (nav_html, breadcrumbs_html, _) = build_page_chrome(&conn, &state.template_engine, &normalized, &dir_name, &user_rules);
         let rendered = state
             .template_engine
             .render(
@@ -473,6 +518,7 @@ struct PageQuery {
 async fn api_page(
     State(state): State<AppState>,
     Query(q): Query<PageQuery>,
+    req: Request,
 ) -> Result<Response, (StatusCode, String)> {
     let normalized = normalize_url_path(&q.path);
     ensure_file_indexed(&state, &normalized).await;
@@ -483,6 +529,10 @@ async fn api_page(
             format!("Database error: {}", e),
         )
     })?;
+
+    let claims = extract_claims_from_request(&req, &state.auth_manager);
+    let default_rules = get_anonymous_rules(&state);
+    let user_rules = claims.as_ref().map(|c| c.acl.clone()).unwrap_or_else(|| default_rules);
 
     let page_query: Option<(String, String, String, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
         .query_row(
@@ -535,7 +585,7 @@ async fn api_page(
             }
         }
 
-        let (nav_html, breadcrumbs_html, toc_html) = build_page_chrome(&conn, &state.template_engine, &normalized, &title);
+        let (nav_html, breadcrumbs_html, toc_html) = build_page_chrome(&conn, &state.template_engine, &normalized, &title, &user_rules);
         let fm_val: serde_json::Value =
             serde_json::from_str(&fm_json).unwrap_or(json!({}));
         let title_source = fm_val.get("title_source").and_then(|v| v.as_str()).unwrap_or("frontmatter").to_string();
@@ -551,6 +601,7 @@ async fn api_page(
             "prev_sibling_url": prev_sibling_url,
             "next_sibling_url": next_sibling_url,
             "config": state.config.to_json_value(),
+            "acl": user_rules,
             "regions": {
                 "content": final_html,
                 "toc": toc_html,
@@ -620,12 +671,28 @@ async fn api_page(
             subdirs.push(d);
         }
 
+        // Filter child pages and subdirectories by ACL permissions
+        child_pages.retain(|p| {
+            if let Some(u) = p.get("url_path").and_then(|v| v.as_str()) {
+                AclEngine::check_permission(u, &user_rules)
+            } else {
+                true
+            }
+        });
+        subdirs.retain(|d| {
+            if let Some(u) = d.get("url_path").and_then(|v| v.as_str()) {
+                AclEngine::check_permission(u, &user_rules)
+            } else {
+                true
+            }
+        });
+
         let dir_name = if normalized == "/" {
             "Home".to_string()
         } else {
             normalized.split('/').last().unwrap_or("Index").to_string()
         };
-        let (nav_html, breadcrumbs_html, _) = build_page_chrome(&conn, &state.template_engine, &normalized, &dir_name);
+        let (nav_html, breadcrumbs_html, _) = build_page_chrome(&conn, &state.template_engine, &normalized, &dir_name, &user_rules);
 
         let content_html = state
             .template_engine
@@ -645,6 +712,7 @@ async fn api_page(
             "url": normalized,
             "frontmatter": {},
             "config": state.config.to_json_value(),
+            "acl": user_rules,
             "regions": {
                 "content": content_html,
                 "toc": "",
@@ -795,7 +863,9 @@ async fn search_page(
     })?;
 
     let claims = extract_claims_from_request(&req, &state.auth_manager);
-    let user_ctx = build_user_context(claims.as_ref(), &state.config);
+    let default_rules = get_anonymous_rules(&state);
+    let user_rules = claims.as_ref().map(|c| c.acl.clone()).unwrap_or_else(|| default_rules.clone());
+    let user_ctx = build_user_context(claims.as_ref(), &state.config, default_rules);
 
     let hits = query_search_hits(
         &conn,
@@ -813,7 +883,7 @@ async fn search_page(
     };
 
     let page_title = format!("Search: {}", display_query);
-    let (nav_html, _, _) = build_page_chrome(&conn, &state.template_engine, "/_search", &page_title);
+    let (nav_html, _, _) = build_page_chrome(&conn, &state.template_engine, "/_search", &page_title, &user_rules);
 
     let search_content = state
         .template_engine
@@ -1080,8 +1150,9 @@ pub fn render_status_response(
     let status_title = status.canonical_reason().unwrap_or("Error").to_string();
     let page_title = format!("{} - {}", status.as_u16(), status_title);
 
+    let default_rules = get_anonymous_rules(state);
     let (nav_html, breadcrumbs_html, _) = if let Ok(conn) = state.db_pool.get() {
-        build_page_chrome(&conn, &state.template_engine, path, &page_title)
+        build_page_chrome(&conn, &state.template_engine, path, &page_title, &default_rules)
     } else {
         (String::new(), String::new(), String::new())
     };
@@ -1246,6 +1317,10 @@ async fn logout_action() -> Response {
 // -------------------------------------------------------------
 // Admin Handlers
 // -------------------------------------------------------------
+async fn admin_redirect_slash() -> Redirect {
+    Redirect::permanent("/_admin/")
+}
+
 async fn admin_page(
     State(state): State<AppState>,
     req: Request,
@@ -1314,7 +1389,12 @@ async fn admin_page(
 struct AdminCreateUserForm {
     username: String,
     password: String,
+    #[serde(default = "default_role")]
     role: String,
+}
+
+fn default_role() -> String {
+    "admin".to_string()
 }
 
 async fn admin_create_user(
@@ -1395,6 +1475,17 @@ async fn admin_create_acl(
         "INSERT INTO acls (username, verb, path_pattern, priority) VALUES (?1, ?2, ?3, ?4);",
         params![form.username, form.verb, form.path_pattern, form.priority],
     );
+
+    // Bump token version for the user (or all users if wildcard) so existing JWTs refresh
+    if form.username == "*" {
+        let _ = conn.execute("UPDATE users SET token_version = token_version + 1;", []);
+    } else {
+        let _ = conn.execute(
+            "UPDATE users SET token_version = token_version + 1 WHERE username = ?1;",
+            params![form.username],
+        );
+    }
+
     Ok(Redirect::to("/_admin/"))
 }
 
@@ -1411,7 +1502,26 @@ async fn admin_delete_acl(
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Look up the target username before deleting
+    let affected_user: Option<String> = conn
+        .query_row("SELECT username FROM acls WHERE id = ?1;", params![form.id], |r| r.get(0))
+        .ok();
+
     let _ = conn.execute("DELETE FROM acls WHERE id = ?1;", params![form.id]);
+
+    // Bump token version so the affected user's JWT refreshes
+    if let Some(user) = affected_user {
+        if user == "*" {
+            let _ = conn.execute("UPDATE users SET token_version = token_version + 1;", []);
+        } else {
+            let _ = conn.execute(
+                "UPDATE users SET token_version = token_version + 1 WHERE username = ?1;",
+                params![user],
+            );
+        }
+    }
+
     Ok(Redirect::to("/_admin/"))
 }
 
@@ -1689,33 +1799,39 @@ struct NavTreeTemplateContext {
 }
 
 impl DirNavNode {
-    fn to_template_context(&self, active_url: &str) -> NavTreeTemplateContext {
+    fn to_template_context(&self, active_url: &str, rules: &[AclRule]) -> NavTreeTemplateContext {
         let mut subdirs = Vec::new();
         for (path, sub) in &self.subdirs {
-            let display_name = sub.index_title.as_deref().unwrap_or(&sub.name).to_string();
-            let is_active = active_url == path;
-            let is_open = is_ancestor_or_self(path, active_url);
-            let child_ctx = sub.to_template_context(active_url);
+            let child_ctx = sub.to_template_context(active_url, rules);
+            let dir_accessible = AclEngine::check_permission(path, rules);
+            // Only include directory if it has accessible contents or directory itself is accessible
+            if !child_ctx.subdirs.is_empty() || !child_ctx.pages.is_empty() || (sub.has_index && dir_accessible) {
+                let display_name = sub.index_title.as_deref().unwrap_or(&sub.name).to_string();
+                let is_active = active_url == path;
+                let is_open = is_ancestor_or_self(path, active_url);
 
-            subdirs.push(NavSubdirTemplateItem {
-                path: path.clone(),
-                display_name,
-                has_index: sub.has_index,
-                is_open,
-                is_active,
-                subdirs: child_ctx.subdirs,
-                pages: child_ctx.pages,
-            });
+                subdirs.push(NavSubdirTemplateItem {
+                    path: path.clone(),
+                    display_name,
+                    has_index: sub.has_index && dir_accessible,
+                    is_open,
+                    is_active,
+                    subdirs: child_ctx.subdirs,
+                    pages: child_ctx.pages,
+                });
+            }
         }
 
         let mut pages = Vec::new();
         for page in &self.pages {
-            let is_active = page.url_path == active_url;
-            pages.push(NavPageTemplateItem {
-                url_path: page.url_path.clone(),
-                title: page.title.clone(),
-                is_active,
-            });
+            if AclEngine::check_permission(&page.url_path, rules) {
+                let is_active = page.url_path == active_url;
+                pages.push(NavPageTemplateItem {
+                    url_path: page.url_path.clone(),
+                    title: page.title.clone(),
+                    is_active,
+                });
+            }
         }
 
         NavTreeTemplateContext { subdirs, pages }
@@ -1727,6 +1843,7 @@ fn build_page_chrome(
     template_engine: &TemplateEngine,
     url_path: &str,
     page_title: &str,
+    user_rules: &[AclRule],
 ) -> (String, String, String) {
     // 1. Hierarchical Navigation Tree
     let mut pages = Vec::new();
@@ -1756,7 +1873,7 @@ fn build_page_chrome(
     }
 
     let root_node = build_nav_tree(pages, dir_titles);
-    let nav_tree_ctx = root_node.to_template_context(url_path);
+    let nav_tree_ctx = root_node.to_template_context(url_path, user_rules);
     let nav_html = template_engine
         .render("components/nav_tree.html", json!({ "tree": nav_tree_ctx }))
         .unwrap_or_default();
