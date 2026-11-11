@@ -6,6 +6,9 @@
     <title>{{ title }} - {{ config.name | default("Hematite") }}</title>
     <link rel="stylesheet" href="/_static/vendor/fontawesome/css/all.min.css">
     <link rel="stylesheet" href="/_static/css/app.css">
+    <script>
+        window.__HEMATITE_USER__ = {{ user | default({}) | tojson | safe }};
+    </script>
 </head>
 <body data-theme="{{ config.theme | default("default") }}">
     <nav class="sidebar" id="region-sidebar">

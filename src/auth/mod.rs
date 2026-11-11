@@ -124,6 +124,19 @@ pub fn pattern_matches(pattern: &str, path: &str) -> bool {
         }
     }
 
+    // Exact string match check
+    if pattern == path {
+        return true;
+    }
+    // Also consider trailing slashes equivalent for non-wildcard patterns (e.g. /_admin matches /_admin/)
+    if !pattern.contains('*') && !pattern.contains('?') {
+        let p_trimmed = pattern.trim_end_matches('/');
+        let path_trimmed = path.trim_end_matches('/');
+        if p_trimmed == path_trimmed {
+            return true;
+        }
+    }
+
     // Convert glob to regex
     // e.g. /docs/* -> ^/docs/[^/]+$, /docs/** -> ^/docs/.*
     let mut regex_str = String::from("^");
@@ -149,8 +162,13 @@ pub fn pattern_matches(pattern: &str, path: &str) -> bool {
     regex_str.push('$');
 
     if let Ok(re) = Regex::new(&regex_str) {
-        re.is_match(path)
-    } else {
-        false
+        if re.is_match(path) {
+            return true;
+        }
+        // If path has trailing slash and didn't match, test path without trailing slash
+        if path.ends_with('/') && path.len() > 1 && re.is_match(path.trim_end_matches('/')) {
+            return true;
+        }
     }
+    false
 }

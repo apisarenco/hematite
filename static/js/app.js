@@ -1,10 +1,122 @@
 // Keep track of the currently rendered pathname & search
 let currentRenderedPath = location.pathname + location.search;
 
+// -------------------------------------------------------------
+// Client-Side ACL Pattern Evaluation & Link Sweeper
+// -------------------------------------------------------------
+function patternMatches(pattern, path) {
+    if (pattern === path) return true;
+    if (!pattern.includes('*') && !pattern.includes('?')) {
+        const pTrimmed = pattern.replace(/\/+$/, '');
+        const pathTrimmed = path.replace(/\/+$/, '');
+        if (pTrimmed === pathTrimmed) return true;
+    }
+    if (pattern.startsWith('^')) {
+        try {
+            return new RegExp(pattern).test(path);
+        } catch (_) {
+            return false;
+        }
+    }
+    // Convert glob pattern to Regex
+    let regexStr = "^";
+    for (let i = 0; i < pattern.length; i++) {
+        const c = pattern[i];
+        if (c === '*') {
+            if (i + 1 < pattern.length && pattern[i + 1] === '*') {
+                regexStr += ".*";
+                i++;
+            } else {
+                regexStr += "[^/]*";
+            }
+        } else if (c === '?') {
+            regexStr += "[^/]";
+        } else if (".+()[]{}^$|\\".includes(c)) {
+            regexStr += "\\" + c;
+        } else {
+            regexStr += c;
+        }
+    }
+    regexStr += "$";
+    try {
+        const re = new RegExp(regexStr);
+        if (re.test(path)) return true;
+        if (path.endsWith('/') && path.length > 1 && re.test(path.replace(/\/+$/, ''))) return true;
+    } catch (_) {
+        return false;
+    }
+    return false;
+}
+
+window.checkPermission = function(path) {
+    const user = window.__HEMATITE_USER__;
+    const rules = (user && Array.isArray(user.acl)) ? user.acl : [];
+    let allowed = false;
+    for (const rule of rules) {
+        if (!rule || !rule.p || !rule.v) continue;
+        if (patternMatches(rule.p, path)) {
+            const v = rule.v.toUpperCase();
+            if (v === 'ALLOW' || v === 'A') {
+                allowed = true;
+            } else if (v === 'DENY' || v === 'D') {
+                allowed = false;
+            }
+        }
+    }
+    return allowed;
+};
+
+function sweepPageLinks() {
+    const links = document.querySelectorAll('a[href]');
+    links.forEach(link => {
+        const href = link.getAttribute('href');
+        if (!href) return;
+        if (href.startsWith('http:') || href.startsWith('https:') || href.startsWith('//') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('#')) return;
+        if (href.startsWith('/_user') || href.startsWith('/_static')) return;
+
+        // Extract normalized target pathname
+        let targetPath = href.split('?')[0].split('#')[0];
+        if (!targetPath.startsWith('/')) {
+            try {
+                const resolved = new URL(href, location.href);
+                targetPath = resolved.pathname;
+            } catch (_) {
+                targetPath = '/' + targetPath;
+            }
+        }
+
+        const isAllowed = window.checkPermission(targetPath);
+        if (!isAllowed) {
+            link.classList.add('acl-inaccessible');
+            link.setAttribute('title', 'Access Denied by magical wards');
+            link.setAttribute('tabindex', '-1');
+            link.setAttribute('aria-disabled', 'true');
+        } else {
+            link.classList.remove('acl-inaccessible');
+            if (link.getAttribute('title') === 'Access Denied by magical wards') {
+                link.removeAttribute('title');
+            }
+            link.removeAttribute('tabindex');
+            link.removeAttribute('aria-disabled');
+        }
+    });
+}
+
+
+
+window.sweepPageLinks = sweepPageLinks;
+
 // SPA Client Navigation Handler
 document.addEventListener('click', async (e) => {
     const link = e.target.closest('a');
     if (!link) return;
+
+    if (link.classList.contains('acl-inaccessible')) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+    }
+
     const href = link.getAttribute('href');
     if (!href || href.startsWith('http:') || href.startsWith('https:') || href.startsWith('//') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('/_user') || href.startsWith('/_admin') || href.startsWith('/_static') || href.startsWith('/_search')) return;
 
@@ -111,8 +223,14 @@ async function loadSpaPage(path, hash) {
                 if (breadcrumbsEl) breadcrumbsEl.innerHTML = data.regions.breadcrumbs;
             }
         }
+        if (data.acl && Array.isArray(data.acl)) {
+            if (!window.__HEMATITE_USER__) window.__HEMATITE_USER__ = {};
+            window.__HEMATITE_USER__.acl = data.acl;
+        }
+
         // Update active link in sidebar and expand directory ancestors without resetting user folder state
         updateActiveSidebar(path);
+        sweepPageLinks();
         currentRenderedPath = path;
 
         if (hash) {
@@ -158,3 +276,13 @@ if (searchInput) {
         }, 200);
     });
 }
+
+// Run on initial load
+document.addEventListener('DOMContentLoaded', () => {
+    updateActiveSidebar(location.pathname);
+    sweepPageLinks();
+});
+updateActiveSidebar(location.pathname);
+sweepPageLinks();
+
+
